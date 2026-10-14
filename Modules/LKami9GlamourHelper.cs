@@ -1,0 +1,2488 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+
+using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Textures;
+using Dalamud.Interface.Utility;
+using Dalamud.Interface.Utility.Raii;
+
+using FFXIVClientStructs.FFXIV.Client.Game;
+
+using Lumina.Excel.Sheets;
+
+using OmniToolbox.Common.Module.Abstractions;
+using OmniToolbox.Common.Module.Enums;
+using OmniToolbox.Common.Module.Models;
+using OmniToolbox.Host;
+
+namespace LKami9.GlamourHelper;
+
+/// <summary>
+/// LKami9幻化助手 —— 从截图识别石之家幻化，列出装备 / 染剂 / 持有情况 / 获取方式。
+///
+/// 输入方式：剪贴板图片 或 图片文件路径。
+/// 识别引擎：Windows 自带 OCR（Windows.Media.Ocr），离线、零安装，经内嵌的 PowerShell 脚本调用。
+/// 关联算法：用 OCR 的坐标把染剂挂到对应装备上（详见 DrawSettings / ParseOcrJson 的注释）。
+/// </summary>
+public sealed class LKami9GlamourHelper : ModuleBase
+{
+    public override ModuleInfo Info { get; } = new()
+    {
+        Title       = "LKami9幻化助手",
+        Description = "粘贴石之家幻化截图（剪贴板或文件），识别出装备与染剂，并显示是否持有、获取方式。支持网页整图 / 网页局部 / 分享图预设 / 手机截图。",
+        Category    = ModuleCategory.Item,
+        Author      = "LKami9",
+        Commands    = [new("用上次的图重新识别", "/omni LKami9GlamourHelper scan")],
+    };
+
+    public override bool HasSettings => true;
+
+    // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
+    private LKami9GlamourHelperConfig config = new();
+
+    // ── 运行时状态 ──
+    private readonly List<SlotResult> results = [];
+    private string status = "尚未识别。把截图放进剪贴板，或填图片路径后点「识别」。";
+    private bool statusIsError;
+    private string lastTiming = "";
+    private bool busy;
+    private int editingIndex = -1;
+
+    // 斧正编辑缓冲（ImGui.InputText 需要 ref 变量，属性不能传 ref；反正一次只编辑一行）
+    private string editName = "";
+    private string editDye1 = "";
+    private string editDye2 = "";
+    private string editHint = "";
+    private readonly List<string> editCandidates = [];
+    private string pathBuffer = "";
+    private bool pathInit;
+
+    /// <summary>警示色（默认橙黄）—— 取自 config，越界自动回退默认值。</summary>
+    private System.Numerics.Vector4 WarnVec
+    {
+        get
+        {
+            var c = this.config.WarnColor;
+            return c is { Length: >= 4 }
+                ? new System.Numerics.Vector4(c[0], c[1], c[2], c[3])
+                : new System.Numerics.Vector4(0.95f, 0.62f, 0.20f, 1f);
+        }
+    }
+
+    /// <summary>错误色（默认偏红）。</summary>
+    private System.Numerics.Vector4 ErrorVec
+    {
+        get
+        {
+            var c = this.config.ErrorColor;
+            return c is { Length: >= 4 }
+                ? new System.Numerics.Vector4(c[0], c[1], c[2], c[3])
+                : new System.Numerics.Vector4(0.95f, 0.35f, 0.30f, 1f);
+        }
+    }
+
+    private static float[] ToArray(System.Numerics.Vector4 v) => [v.X, v.Y, v.Z, v.W];
+
+    /// <summary>持有色（「有 xN」）。</summary>
+    private System.Numerics.Vector4 OwnedVec
+    {
+        get
+        {
+            var c = this.config.OwnedColor;
+            return c is { Length: >= 4 }
+                ? new System.Numerics.Vector4(c[0], c[1], c[2], c[3])
+                : new System.Numerics.Vector4(0.40f, 0.90f, 0.40f, 1f);
+        }
+    }
+
+    /// <summary>未持有色（「无」）。</summary>
+    private System.Numerics.Vector4 NotOwnedVec
+    {
+        get
+        {
+            var c = this.config.NotOwnedColor;
+            return c is { Length: >= 4 }
+                ? new System.Numerics.Vector4(c[0], c[1], c[2], c[3])
+                : new System.Numerics.Vector4(0.90f, 0.55f, 0.40f, 1f);
+        }
+    }
+
+    // ── 数据索引（惰性构建）──
+    private Dictionary<string, (uint Id, uint Icon, string Slot, bool Untradable)>? itemByName;
+    private Dictionary<string, uint>? stainByName;
+    private List<string>? dyeLex;
+
+    private static readonly string[] SpecialLex = ["不可染色", "无染色"];
+    private static readonly string[] SlotOrder =
+        ["主手", "副手", "头部", "上衣", "手部", "腿部", "脚部", "耳坠", "项链", "手镯", "戒指"];
+
+    // ══════════════════════════════════════════════════════════
+    //  生命周期
+    // ══════════════════════════════════════════════════════════
+
+    protected override void OnEnable()
+    {
+        try { EnsureOcrScript(); }
+        catch (Exception ex) { DalamudServices.PluginLog.Error(ex, "[幻化助手] 写出 OCR 脚本失败"); }
+    }
+
+    protected override void OnDisable() { }
+
+    protected override void OnDispose() { }
+
+    public override bool ResetSettings()
+    {
+        this.config = new LKami9GlamourHelperConfig();
+        this.results.Clear();
+        this.status = "设置已重置。";
+        return true;
+    }
+
+    public override bool TryHandleCommand(string arguments)
+    {
+        var arg = (arguments ?? "").Trim().ToLowerInvariant();
+        if (arg is "scan" or "识别" or "")
+        {
+            if (!string.IsNullOrWhiteSpace(this.config.LastImagePath) && File.Exists(this.config.LastImagePath))
+                _ = this.RunRecognize(this.config.LastImagePath);
+            else
+                _ = this.RunFromClipboard();
+            return true;
+        }
+        return false;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  UI
+    // ══════════════════════════════════════════════════════════
+
+    public override bool DrawSettings()
+    {
+        TickPlateWrite();          // 每帧只处理写入队列里的一件（避免同帧多次调 Agent）
+        TickApplyPlate();          // 应用模板也分帧发指令
+        DrawInputSection();
+        ImGui.Separator();
+        DrawResultSection();
+        DrawPlateSection();
+        return false;
+    }
+
+    private void DrawInputSection()
+    {
+        ImGui.TextUnformatted("① 输入");
+        ImGui.SameLine();
+        ImGui.TextDisabled("（截图后直接抓剪贴板，或填图片路径）");
+
+        // 路径输入占满整行（之前把宽度算成"剩余-200"，导致后面的按钮被窗口边缘裁掉）
+        if (!this.pathInit)
+        {
+            this.pathBuffer = this.config.LastImagePath ?? "";
+            this.pathInit = true;
+        }
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.InputTextWithHint("###imgPath", "图片文件路径（可直接粘路径）", ref this.pathBuffer, 512))
+            this.config.LastImagePath = this.pathBuffer;
+
+        // 按钮另起一行，避免被裁切
+        using (ImRaii.Disabled(this.busy))
+        {
+            if (ImGui.Button("从剪贴板识别"))
+                _ = this.RunFromClipboard();
+
+            ImGui.SameLine();
+            if (ImGui.Button("识别这个文件"))
+            {
+                if (string.IsNullOrWhiteSpace(this.pathBuffer) || !File.Exists(this.pathBuffer))
+                {
+                    this.statusIsError = true;
+                    this.status = "图片路径无效（检查路径是否正确）。";
+                }
+                else
+                    _ = this.RunRecognize(this.pathBuffer);
+            }
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("打开截图目录"))
+            OpenFolder(WorkDir());
+
+        if (this.busy)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.8f, 0.3f, 1f), "识别中…");
+        }
+
+        if (this.statusIsError)
+            ImGui.TextColored(this.ErrorVec, this.status);
+        else
+            ImGui.TextWrapped(this.status);
+        if (!string.IsNullOrEmpty(this.lastTiming))
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled(this.lastTiming);
+        }
+
+        var showUnknowns = this.config.ShowUnknowns;
+        if (ImGui.Checkbox("列出未识别文本（可手动指派成装备）", ref showUnknowns))
+            this.config.ShowUnknowns = showUnknowns;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("OCR 认错字导致匹配不上时，把那些片段列出来，\n你可以粘贴正确名称把它补进结果表。");
+
+        // ── 模块文字颜色配置 ──
+        if (ImGui.CollapsingHeader("模块文字颜色配置###textColors"))
+        {
+            ImGui.TextDisabled("这些颜色只影响本模块自己画出来的文字，不影响游戏/插件主题。");
+
+            var w = this.WarnVec;
+            ImGui.SetNextItemWidth(240 * ImGuiHelpers.GlobalScale);
+            if (ImGui.ColorEdit4("警示色###warnCol", ref w)) this.config.WarnColor = ToArray(w);
+            ImGui.SameLine();
+            if (ImGui.SmallButton("重置##warnReset")) this.config.WarnColor = [0.95f, 0.62f, 0.20f, 1f];
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("用在：问号、模糊匹配提示那行、斧正面板标题");
+
+            var e = this.ErrorVec;
+            ImGui.SetNextItemWidth(240 * ImGuiHelpers.GlobalScale);
+            if (ImGui.ColorEdit4("错误色###errCol", ref e)) this.config.ErrorColor = ToArray(e);
+            ImGui.SameLine();
+            if (ImGui.SmallButton("重置##errReset")) this.config.ErrorColor = [0.95f, 0.35f, 0.30f, 1f];
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("用在：OCR 失败、路径无效、解析失败等状态文字");
+
+            var o = this.OwnedVec;
+            ImGui.SetNextItemWidth(240 * ImGuiHelpers.GlobalScale);
+            if (ImGui.ColorEdit4("持有色###ownedCol", ref o)) this.config.OwnedColor = ToArray(o);
+            ImGui.SameLine();
+            if (ImGui.SmallButton("重置##ownedReset")) this.config.OwnedColor = [0.40f, 0.90f, 0.40f, 1f];
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("用在：持有列里的「有 xN」");
+
+            var n = this.NotOwnedVec;
+            ImGui.SetNextItemWidth(240 * ImGuiHelpers.GlobalScale);
+            if (ImGui.ColorEdit4("未持有色###notOwnedCol", ref n)) this.config.NotOwnedColor = ToArray(n);
+            ImGui.SameLine();
+            if (ImGui.SmallButton("重置##notOwnedReset")) this.config.NotOwnedColor = [0.90f, 0.55f, 0.40f, 1f];
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("用在：持有列里的「无」");
+
+            ImGui.Spacing();
+            if (ImGui.Button("全部恢复默认色"))
+            {
+                this.config.WarnColor     = [0.95f, 0.62f, 0.20f, 1f];
+                this.config.ErrorColor    = [0.95f, 0.35f, 0.30f, 1f];
+                this.config.OwnedColor    = [0.40f, 0.90f, 0.40f, 1f];
+                this.config.NotOwnedColor = [0.90f, 0.55f, 0.40f, 1f];
+            }
+        }
+    }
+
+    private void DrawResultSection()
+    {
+        if (this.results.Count == 0)
+        {
+            ImGui.TextDisabled("② 识别结果（还没有）");
+            return;
+        }
+
+        var warn = this.WarnVec;
+        ImGui.TextUnformatted($"② 识别结果（{this.results.Count} 件）");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("复制清单"))
+            CopyTextToClipboard(BuildClipboardText());
+
+        var needFix = this.results.Count(r => r.NeedsReview) + this.results.Sum(r => r.Dyes.Count(d => d.NeedsReview));
+        if (needFix > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(warn, $"? {needFix} 处模糊匹配 —— 点行尾「改」可粘贴正确名称斧正");
+        }
+
+        if (!ImGui.BeginTable("###glamourTable", 7,
+                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit))
+            return;
+
+        ImGui.TableSetupColumn("槽位", ImGuiTableColumnFlags.WidthFixed, 46 * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 36 * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("装备", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("染剂（颜色）", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("获取方式", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("持有", ImGuiTableColumnFlags.WidthFixed, 56 * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 26 * ImGuiHelpers.GlobalScale);
+        ImGui.TableHeadersRow();
+
+        for (var i = 0; i < this.results.Count; i++)
+        {
+            var r = this.results[i];
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(r.Slot);
+
+            ImGui.TableNextColumn();
+            DrawGameIcon(r.IconId, 26f);
+
+            // 装备名（模糊匹配打问号）
+            ImGui.TableNextColumn();
+            if (r.NeedsReview) ImGui.TextColored(warn, "?");
+            else ImGui.TextDisabled("　");
+            ImGui.SameLine();
+            ImGui.TextUnformatted(r.Name);
+            if (r.NeedsReview && ImGui.IsItemHovered())
+                ImGui.SetTooltip($"OCR 识别不确定（匹配分 {r.MatchScore}）\n点行尾「改」粘贴正确名称即可斧正");
+            if (r.MatchScore is < 100 and > 0)
+            {
+                ImGui.SameLine();
+                ImGui.TextDisabled($"({r.MatchScore})");
+            }
+
+            // 染剂（逐个标问号）
+            ImGui.TableNextColumn();
+            if (r.Dyes.Count == 0)
+            {
+                ImGui.TextDisabled("—");
+            }
+            else
+            {
+                for (var k = 0; k < r.Dyes.Count; k++)
+                {
+                    if (k > 0) { ImGui.SameLine(); ImGui.TextUnformatted(" /"); ImGui.SameLine(); }
+                    var d = r.Dyes[k];
+                    if (d.NeedsReview) { ImGui.TextColored(warn, "?"); ImGui.SameLine(); }
+
+                    // 染剂持有：✓xN（够染）/ ✗缺（没有这瓶染剂）
+                    var own = d.IsEmpty ? (0, "") : DyeOwned(d.Id);
+                    ImGui.TextUnformatted(d.Name);
+                    if (!d.IsEmpty)
+                    {
+                        ImGui.SameLine();
+                        if (own.Item1 > 0)
+                            ImGui.TextDisabled($"有 {own.Item1}");
+                        else
+                            ImGui.TextColored(this.NotOwnedVec, "缺");
+
+                        if (ImGui.IsItemHovered())
+                            ImGui.SetTooltip(this.BuildDyeTooltip(d, own));
+                    }
+                    else if (d.NeedsReview && ImGui.IsItemHovered())
+                    {
+                        ImGui.SetTooltip($"染剂识别不确定（匹配分 {d.Score}）\n点行尾「改」可改染剂名");
+                    }
+                }
+            }
+
+            // 获取方式
+            //   已持有 → 「已拥有」
+            //   未持有 → 获取方式 + 是否可交易（不可交易 = 只能自己搞；可交易 = 市场板还能买）
+            ImGui.TableNextColumn();
+            var srcs = GetSources(r.ItemId);                 // 已按优先级排好，不含版本号
+            var isCash = this.cashShopItems.Contains(r.ItemId);
+            var trade = r.Untradable ? "不可交易" : "可交易";
+            var hasStore = this.storeUrls.TryGetValue(r.ItemId, out var storeUrl);
+
+            if (r.Owned > 0)
+            {
+                ImGui.TextUnformatted("已拥有");
+            }
+            else
+            {
+                var main = isCash ? "商城购买" : (srcs.Count > 0 ? srcs[0] : "来源未知");
+                ImGui.TextUnformatted(main);
+                ImGui.SameLine();
+                ImGui.TextDisabled("· " + trade);
+            }
+
+            // 悬停：完整信息
+            if (ImGui.IsItemHovered())
+            {
+                var tip = new System.Text.StringBuilder();
+                if (r.Owned > 0)
+                {
+                    tip.AppendLine("已持有：" + (string.IsNullOrEmpty(r.OwnedWhere) ? $"x{r.Owned}" : r.OwnedWhere));
+                    tip.AppendLine();
+                }
+                tip.AppendLine(isCash ? "获取方式：商城购买" : "获取方式：");
+                if (srcs.Count > 0)
+                {
+                    foreach (var s in srcs.Take(5)) tip.AppendLine("  · " + s);
+                    if (srcs.Count > 5) tip.AppendLine($"  …还有 {srcs.Count - 5} 条");
+                    var det = GetSourceDetails(r.ItemId);
+                    if (det.Count > 0)
+                    {
+                        tip.AppendLine("  详情：");
+                        foreach (var d in det.Take(5)) tip.AppendLine("      " + d);
+                    }
+                }
+                else if (!isCash)
+                    tip.AppendLine("  · 来源未知");
+                tip.AppendLine();
+                tip.AppendLine("获取方式数据：最终幻想XIV中文维基（灰机wiki） CC BY-NC-SA 3.0");
+
+                tip.AppendLine();
+                tip.AppendLine("交易：" + trade);
+                if (this.patchInfo.TryGetValue(r.ItemId, out var patch)) tip.AppendLine(patch);
+                if (hasStore) tip.AppendLine("\n商城商品页（右键此格复制链接）：\n" + storeUrl);
+                ImGui.SetTooltip(tip.ToString().TrimEnd());
+            }
+
+            // 商城道具：右键复制商品页链接
+            if (hasStore && ImGui.IsItemClicked(ImGuiMouseButton.Right))
+            {
+                ImGui.SetClipboardText(storeUrl);
+                this.statusIsError = false;
+                this.status = "已复制商城商品页链接：" + storeUrl;
+            }
+
+            ImGui.TableNextColumn();
+            if (r.Owned > 0)
+                ImGui.TextColored(this.OwnedVec, $"有 x{r.Owned}");
+            else
+                ImGui.TextColored(this.NotOwnedVec, "无");
+            if (r.Owned > 0 && ImGui.IsItemHovered())
+                ImGui.SetTooltip(string.IsNullOrEmpty(r.OwnedWhere) ? "已持有" : "持有位置：" + r.OwnedWhere);
+
+            ImGui.TableNextColumn();
+            if (ImGui.SmallButton($"改###fix{i}"))
+            {
+                this.editingIndex = this.editingIndex == i ? -1 : i;
+                if (this.editingIndex == i) PrepareEditor(r);
+            }
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("斧正这一行（粘贴正确的装备/染剂名）");
+        }
+
+        ImGui.EndTable();
+
+        DrawEditorPanel(warn);
+        DrawUnknownSection(warn);
+    }
+
+    // ── 斧正面板（一次编辑一行）──
+    private void PrepareEditor(SlotResult r)
+    {
+        this.editName = r.Name;
+        this.editDye1 = r.Dyes.Count > 0 && !r.Dyes[0].IsEmpty ? r.Dyes[0].Name : "";
+        this.editDye2 = r.Dyes.Count > 1 && !r.Dyes[1].IsEmpty ? r.Dyes[1].Name : "";
+        this.editHint = "";
+        this.editCandidates.Clear();
+    }
+
+    private void DrawEditorPanel(System.Numerics.Vector4 warn)
+    {
+        if (this.editingIndex < 0 || this.editingIndex >= this.results.Count) return;
+        var r = this.results[this.editingIndex];
+
+        ImGui.Separator();
+        ImGui.TextColored(warn, $"改 斧正「{r.Slot}」");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("关闭")) { this.editingIndex = -1; return; }
+
+        ImGui.TextDisabled("粘贴或输入正确的名称后点「确认」（会自动查游戏数据表并更新图标/槽位/持有）");
+
+        // 装备名
+        ImGui.SetNextItemWidth(320 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("装备名###fixName", ref this.editName, 128);
+        ImGui.SameLine();
+        if (ImGui.Button("确认装备")) ApplyItemFix(r, this.editName);
+
+        // 染剂 1 / 2
+        ImGui.SetNextItemWidth(150 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("染剂1###fixDye1", ref this.editDye1, 64);
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(150 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("染剂2###fixDye2", ref this.editDye2, 64);
+        ImGui.SameLine();
+        if (ImGui.Button("确认染剂")) ApplyDyeFix(r);
+
+        // 候选（点击即用）
+        if (this.editCandidates.Count > 0)
+        {
+            ImGui.TextDisabled("候选（点击选用）：");
+            for (var i = 0; i < this.editCandidates.Count; i++)
+            {
+                if (i > 0) ImGui.SameLine();
+                if (ImGui.SmallButton($"{this.editCandidates[i]}###cand{i}"))
+                {
+                    var pick = this.editCandidates[i];
+                    this.editName = pick;
+                    ApplyItemFix(r, pick);
+                    break;
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(this.editHint))
+            ImGui.TextColored(warn, this.editHint);
+    }
+
+    private void ApplyItemFix(SlotResult r, string input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) { this.editHint = "请输入装备名。"; return; }
+        var cands = new List<string>();
+        var res = ResolveItem(input, cands);
+        if (res == null)
+        {
+            this.editHint = $"没找到「{input}」对应的装备 —— 检查名称，或换个写法。";
+            this.editCandidates.Clear();
+            return;
+        }
+        var item = res.Value;
+        r.ItemId = item.Id;
+        r.IconId = item.Icon;
+        r.Name = item.Name;
+        r.Slot = item.Slot;
+        r.MatchScore = 100;
+        r.NeedsReview = false;
+        r.Owned = CountOwned(item.Id, out var whereNow);
+        r.OwnedWhere = whereNow;
+
+        this.editCandidates.Clear();
+        this.editCandidates.AddRange(cands);
+        this.editName = item.Name;
+        this.editHint = cands.Count > 0 ? "已填入最接近的一项（若不是你要的，点候选换一个）" : "已更新";
+        SortResults();
+    }
+
+    private void ApplyDyeFix(SlotResult r)
+    {
+        var dyes = new List<DyeResult>();
+        foreach (var txt in new[] { this.editDye1, this.editDye2 })
+        {
+            if (string.IsNullOrWhiteSpace(txt))
+            {
+                dyes.Add(new DyeResult("无染色", 0, true, 100));
+                continue;
+            }
+            var cands = new List<string>();
+            var res = ResolveDye(txt, cands);
+            if (res == null)
+            {
+                this.editHint = $"染剂「{txt}」没找到。";
+                return;
+            }
+            dyes.Add(new DyeResult(res.Value.Name, res.Value.Id, false, 100));
+        }
+        r.Dyes = dyes;
+        this.editHint = "染剂已更新";
+    }
+
+    // ── 未识别片段（可手动指派成装备）──
+    private void DrawUnknownSection(System.Numerics.Vector4 warn)
+    {
+        if (!this.config.ShowUnknowns || this.unknowns.Count == 0) return;
+
+        ImGui.Separator();
+        if (!ImGui.CollapsingHeader($"③ 未识别文本 {this.unknowns.Count} 段（可手动指派成装备）###unknowns"))
+            return;
+
+        ImGui.TextDisabled("这些文字没能匹配到游戏道具，可能是 OCR 错字 —— 粘贴正确名称可把它补进结果表。");
+
+        for (var i = 0; i < this.unknowns.Count; i++)
+        {
+            var u = this.unknowns[i];
+            ImGui.TextDisabled($"[{u.Text}]");
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(240 * ImGuiHelpers.GlobalScale);
+            ImGui.InputText($"###uf{i}", ref u.EditBuffer, 128);
+            ImGui.SameLine();
+            if (ImGui.Button($"指派###ub{i}"))
+            {
+                var cands = new List<string>();
+                var res = ResolveItem(u.EditBuffer, cands);
+                if (res == null) { u.Hint = "没找到该装备。"; }
+                else
+                {
+                    var item = res.Value;
+                    var existing = this.results.FirstOrDefault(x => x.Slot == item.Slot);
+                    if (existing != null && existing.ItemId != item.Id)
+                    {
+                        existing.ItemId = item.Id; existing.IconId = item.Icon; existing.Name = item.Name;
+                        existing.MatchScore = 100; existing.NeedsReview = false;
+                        existing.Owned = CountOwned(item.Id); existing.Dyes = [];
+                    }
+                    else
+                    {
+                        this.results.Add(new SlotResult
+                        {
+                            Slot = item.Slot, ItemId = item.Id, IconId = item.Icon, Name = item.Name,
+                            MatchScore = 100, Owned = CountOwned(item.Id), OwnedWhere = "",
+                        });
+                    }
+                    this.SortResults();
+                    u.Hint = "已指派";
+                }
+            }
+            if (!string.IsNullOrEmpty(u.Hint)) { ImGui.SameLine(); ImGui.TextColored(warn, u.Hint); }
+        }
+    }
+
+    private void SortResults()
+    {
+        var sorted = this.results.OrderBy(r => Array.IndexOf(SlotOrder, r.Slot)).ToList();
+        this.results.Clear();
+        this.results.AddRange(sorted);
+        for (var i = 0; i < this.results.Count; i++) this.results[i].Index = i;
+        this.editingIndex = -1;
+    }
+
+    // ── 手动斧正的解析（比 OCR 匹配宽松：这是玩家明确意图）──
+    private (uint Id, uint Icon, string Name, string Slot)? ResolveItem(string input, List<string> candidates)
+    {
+        BuildIndexIfNeeded();
+        var s = StripNoise(input);
+        if (s.Length < 2) return null;
+
+        if (this.itemByName!.TryGetValue(s, out var exact))
+            return (exact.Id, exact.Icon, s, exact.Slot);
+
+        // 玩家可能粘贴了带前后缀/空格的全文 → 先试"包含"
+        var hits = this.itemByName!.Keys
+            .Where(k => k.Contains(s) || s.Contains(k))
+            .OrderBy(k => Math.Abs(k.Length - s.Length)).Take(8).ToList();
+
+        if (hits.Count == 0)
+            hits = this.itemByName!.Keys
+                .Where(k => Math.Abs(k.Length - s.Length) <= 2 && Lev(s, k) <= 2)
+                .OrderBy(k => Lev(s, k)).Take(8).ToList();
+
+        if (hits.Count == 0) return null;
+
+        candidates.Clear();
+        candidates.AddRange(hits);
+        var n = hits[0];
+        var v = this.itemByName![n];
+        return (v.Id, v.Icon, n, v.Slot);
+    }
+
+    private (uint Id, string Name)? ResolveDye(string input, List<string> candidates)
+    {
+        var s = StripNoise(input);
+        if (s.Length < 2) return null;
+        if (s is "无染色" or "不可染色") return (0u, s);
+
+        if (this.stainByName!.TryGetValue(s, out var exact)) return (exact, s);
+
+        var hits = this.stainByName!.Keys
+            .Where(k => k.Contains(s) || s.Contains(k) ||
+                        (Math.Abs(k.Length - s.Length) <= 1 && Lev(s, k) <= 1))
+            .Take(8).ToList();
+        if (hits.Count == 0) return null;
+
+        candidates.Clear();
+        candidates.AddRange(hits);
+        return (this.stainByName![hits[0]], hits[0]);
+    }
+
+    private void DrawGameIcon(uint iconId, float size)
+    {
+        try
+        {
+            if (iconId == 0) { ImGui.Dummy(new System.Numerics.Vector2(size, size)); return; }
+            var folder = iconId - (iconId % 1000);
+            var tex = DalamudServices.TextureProvider
+                .GetFromGame($"ui/icon/{folder:D6}/{iconId:D6}_hr1.tex").GetWrapOrEmpty();
+            ImGui.Image(tex.Handle, new System.Numerics.Vector2(size, size) * ImGuiHelpers.GlobalScale);
+        }
+        catch
+        {
+            ImGui.Dummy(new System.Numerics.Vector2(size, size));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  识别流程
+    // ══════════════════════════════════════════════════════════
+
+    private async Task RunFromClipboard()
+    {
+        if (this.busy) return;
+        this.busy = true;
+        try
+        {
+            var dir = WorkDir();
+            Directory.CreateDirectory(dir);
+            var img = Path.Combine(dir, "clipboard.png");
+            this.status = "正在从剪贴板取图…";
+
+            var (ok, outp) = await RunPowerShell(ScriptPath("clip.ps1"), img);
+            if (!ok || !File.Exists(img))
+            {
+                this.statusIsError = true;
+                this.status = "剪贴板里没有图片（先截图，再点这个按钮）。" + (outp.Length > 0 ? " " + outp : "");
+                return;
+            }
+            await RecognizeInternal(img);
+        }
+        finally { this.busy = false; }
+    }
+
+    private async Task RunRecognize(string imagePath)
+    {
+        if (this.busy) return;
+        this.busy = true;
+        try { await RecognizeInternal(imagePath); }
+        finally { this.busy = false; }
+    }
+
+    private async Task RecognizeInternal(string imagePath)
+    {
+        var sw = Stopwatch.StartNew();
+        this.status = "正在 OCR 识别…";
+        this.config.LastImagePath = imagePath;   // 宿主自动持久化
+
+        var json = Path.Combine(WorkDir(), "ocr.json");
+        try { File.Delete(json); } catch { }
+        // ocr.ps1 需要两个参数：图片路径 + 输出 json 路径
+        var (ok, outp) = await RunPowerShell(ScriptPath("ocr.ps1"), imagePath, json);
+        if (!ok || !File.Exists(json))
+        {
+            this.statusIsError = true;
+            this.status = "OCR 失败：" + DescribeScriptFailure(outp);
+            return;
+        }
+
+        var ocrMs = sw.ElapsedMilliseconds;
+        try
+        {
+            var text = await File.ReadAllTextAsync(json, Encoding.UTF8);
+            BuildIndexIfNeeded();
+            var parsed = ParseOcrJson(text);
+            this.results.Clear();
+            this.results.AddRange(parsed);
+            var needFix = parsed.Count(r => r.NeedsReview);
+            var unknownN = this.unknowns.Count;
+            this.statusIsError = false;
+            this.status = parsed.Count > 0
+                ? $"识别完成：{parsed.Count} 件装备" +
+                  (needFix > 0 ? $"，其中 {needFix} 件是模糊匹配（打 ?，可点「改」斧正）" : "，全部精确匹配") +
+                  (unknownN > 0 && this.config.ShowUnknowns ? $"，另有 {unknownN} 段未识别文本可手动指派" : "")
+                : "识别完成，但没找到任何装备名 —— 请确认截图里包含装备清单（带装备名的那块）。";
+            this.lastTiming = $"(OCR {ocrMs} ms / 匹配 {sw.ElapsedMilliseconds - ocrMs} ms)";
+        }
+        catch (Exception ex)
+        {
+            this.statusIsError = true;
+            this.status = "解析失败：" + ex.Message;
+            DalamudServices.PluginLog.Error(ex, "[幻化助手] 解析 OCR JSON 失败");
+        }
+    }
+
+    private static string WorkDir() => Path.Combine(Path.GetTempPath(), "LKami9GlamourHelper");
+
+    private static string ScriptPath(string name) => Path.Combine(WorkDir(), name);
+
+    private static async Task<(bool Ok, string Output)> RunPowerShell(string script, params string[] scriptArgs)
+    {
+        try
+        {
+            var quoted = string.Join(" ", scriptArgs.Select(a => $"\"{a}\""));
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{script}\" {quoted}",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                // 不要强制 UTF-8：PS 5.1 的控制台输出用的是系统代码页（中文系统是 GBK），
+                //   强行按 UTF-8 解码会把错误信息变成乱码
+                StandardOutputEncoding = Encoding.Default,
+                StandardErrorEncoding = Encoding.Default,
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return (false, "无法启动 PowerShell");
+            var so = await p.StandardOutput.ReadToEndAsync();
+            var se = await p.StandardError.ReadToEndAsync();
+            p.WaitForExit(60000);
+
+            // 脚本自己写的错误日志（UTF-8，不受控制台代码页影响）
+            var log = Path.Combine(WorkDir(), "last_error.txt");
+            var fileErr = File.Exists(log) ? File.ReadAllText(log, Encoding.UTF8).Trim() : "";
+            try { File.Delete(log); } catch { }
+
+            var msg = string.IsNullOrWhiteSpace(fileErr)
+                ? (so + " " + se).Trim()
+                : fileErr;
+            return (p.ExitCode == 0, msg.Length > 500 ? msg[..500] : msg);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  引擎：OCR JSON → 槽位 / 装备 / 染剂
+    // ══════════════════════════════════════════════════════════
+
+    private List<SlotResult> ParseOcrJson(string json)
+    {
+        LoadOmniCache();   // 先载入 OmniToolbox 的角色数据缓存（投影台/收藏柜/雇员/部队箱/房屋仓库）
+        this.dyeOwnedCache.Clear();   // 每次识别重新统计染剂持有量
+        var rows = new List<(double X, double Y, uint Id, uint Icon, string Name, string Slot, int Score)>();
+        this.unknowns.Clear();
+
+        using var doc = JsonDocument.Parse(json);
+        foreach (var line in doc.RootElement.GetProperty("lines").EnumerateArray())
+        {
+            // 把这一行展开成「字符 + 坐标」序列（OCR 对中文是一个汉字一个"词"）
+            var chars = new List<(char C, double X, double Y)>();
+            foreach (var w in line.GetProperty("words").EnumerateArray())
+            {
+                var t = w.GetProperty("text").GetString() ?? "";
+                double wx = w.GetProperty("x").GetDouble(), wy = w.GetProperty("y").GetDouble(), ww = w.GetProperty("w").GetDouble();
+                if (t.Length == 0 || ww <= 0) continue;
+                var step = ww / t.Length;
+                for (int i = 0; i < t.Length; i++) chars.Add((t[i], wx + i * step, wy));
+            }
+            if (chars.Count == 0) continue;
+
+            var compact = StripNoise(new string(chars.Select(c => c.C).ToArray()));
+            if (compact.Length < 2) continue;
+
+            // ① 先判是否装备名
+            var score = 0;
+            var cand = TryItem(compact, out score);
+            if (cand != null && score >= 70)
+            {
+                var v = this.itemByName![cand];
+                rows.Add((chars[0].X, chars[0].Y, v.Id, v.Icon, cand, v.Slot, score));
+                continue;
+            }
+
+            // ② 否则抽染剂词（同一行可能有多颗）
+            var before = this.pendingDyes.Count;
+            CollectDyes(compact, chars);
+            if (this.pendingDyes.Count == before && LooksLikeName(compact))
+                this.unknowns.Add(new UnknownFragment { Text = compact });
+        }
+
+        // 结构约束：幻化每个槽位只能一件（戒指可两件）→ 消除误匹配
+        var chosen = new List<(double X, double Y, uint Id, uint Icon, string Name, string Slot, int Score)>();
+        foreach (var g in rows.GroupBy(r => r.Slot))
+        {
+            var ordered = g.OrderByDescending(r => r.Score).ThenBy(r => r.Y);
+            chosen.AddRange(g.Key == "戒指" ? ordered.Take(2) : ordered.Take(1));
+        }
+
+        // 关联：每个染剂词找加权距离最近的装备（垂直为主，只允许在装备名下方或同行）
+        var byRow = new Dictionary<int, List<DyeResult>>();
+        for (int i = 0; i < chosen.Count; i++) byRow[i] = [];
+        foreach (var d in this.pendingDyes)
+        {
+            double best = double.MaxValue; int bi = -1;
+            for (int i = 0; i < chosen.Count; i++)
+            {
+                var r = chosen[i];
+                var dy = d.Y - r.Y;
+                if (dy < -14) continue;
+                var dist = dy * 2.0 + Math.Abs(d.X - r.X) * 0.6;
+                if (dist < best) { best = dist; bi = i; }
+            }
+            if (bi >= 0 && best < 300)
+                byRow[bi].Add(new DyeResult(d.Name, d.Id, d.IsEmpty, d.Score, d.X));
+        }
+        this.pendingDyes.Clear();
+
+        // 同一装备的染剂按 **X 坐标升序** = 图上的左右顺序（槽1 / 槽2）
+        var list = new List<SlotResult>();
+        for (int i = 0; i < chosen.Count; i++)
+        {
+            var r = chosen[i];
+            var dyes = byRow[i].OrderBy(x => x.X).ToList();
+            list.Add(new SlotResult
+            {
+                Index = i,
+                Slot = r.Slot,
+                ItemId = r.Id,
+                IconId = r.Icon,
+                Name = r.Name,
+                MatchScore = r.Score,
+                NeedsReview = r.Score < 100,
+                Dyes = dyes,
+                Untradable = this.itemByName!.TryGetValue(r.Name, out var metaRow) && metaRow.Untradable,
+                Owned = CountOwned(r.Id, out var whereOwned),
+                OwnedWhere = whereOwned,
+                Source = string.Join(" / ", GetSources(r.Id)),
+            });
+        }
+        return list.OrderBy(r => Array.IndexOf(SlotOrder, r.Slot)).Select((r, k) => { r.Index = k; return r; }).ToList();
+    }
+
+    /// <summary>看起来像名字的片段（用于「未识别」栏 —— 过滤掉纯符号/数字/太长的页脚）</summary>
+    private static bool LooksLikeName(string s)
+    {
+        if (s.Length is < 2 or > 14) return false;
+        var cjk = s.Count(c => c >= 0x4E00 && c <= 0x9FFF);
+        return cjk >= 2 && cjk * 2 >= s.Length;      // 至少一半是汉字
+    }
+
+    private readonly List<(double X, double Y, uint Id, string Name, bool IsEmpty, int Score)> pendingDyes = [];
+    private readonly List<UnknownFragment> unknowns = [];
+
+    // 抽染剂：精确最长优先 → 模糊（等长编辑距离 ≤2）
+    private void CollectDyes(string s, List<(char C, double X, double Y)> chars)
+    {
+        int i = 0;
+        while (i < s.Length)
+        {
+            var hit = false;
+            foreach (var w in SpecialLex)
+            {
+                if (i + w.Length <= s.Length && s.AsSpan(i, w.Length).SequenceEqual(w))
+                {
+                    this.pendingDyes.Add((chars[i].X, chars[i].Y, 0u, w, true, 100));
+                    i += w.Length; hit = true; break;
+                }
+            }
+            if (hit) continue;
+
+            foreach (var d in this.dyeLex!)
+            {
+                if (i + d.Length <= s.Length && s.AsSpan(i, d.Length).SequenceEqual(d))
+                {
+                    this.pendingDyes.Add((chars[i].X, chars[i].Y, this.stainByName![d], d, false, 100));
+                    i += d.Length; hit = true; break;
+                }
+            }
+            if (hit) continue;
+
+            string? bestDye = null; var bestLen = 0; var bestDist = 9;
+            foreach (var len in new[] { 2, 3, 4 })
+            {
+                if (i + len > s.Length) continue;
+                var seg = s.Substring(i, len);
+                foreach (var d in this.dyeLex!)
+                {
+                    if (d.Length != len) continue;
+                    var dist = Lev(seg, d);
+                    if (dist < bestDist) { bestDist = dist; bestDye = d; bestLen = len; }
+                }
+            }
+            if (bestDye != null && bestDist <= 2)
+            {
+                // 距离 1 → 92 分，距离 2 → 80 分（都 < 100，UI 会打问号）
+                this.pendingDyes.Add((chars[i].X, chars[i].Y, this.stainByName![bestDye], bestDye, false, bestDist == 1 ? 92 : 80));
+                i += bestLen; continue;
+            }
+            i++;
+        }
+    }
+
+    // 装备名匹配：剥已知后缀 → 精确 → 模糊（短名只允许精确，避免噪音误命中）
+    private string? TryItem(string s, out int score)
+    {
+        score = 0;
+        if (s.Length < 2) return null;
+
+        if (this.itemByName!.TryGetValue(s, out var direct))
+        {
+            score = 100;
+            return s;
+        }
+        var trimmed = s.Replace("（复制品）", "").Replace("(复制品)", "").Trim('（', '）', '(', ')', ' ');
+        if (trimmed != s && this.itemByName!.TryGetValue(trimmed, out var t2))
+        {
+            score = 100;
+            return trimmed;
+        }
+
+        if (s.Length <= 3) return null;   // 短名只接受精确
+
+        string? best = null; var bestScore = 0;
+        foreach (var k in this.itemByName!.Keys)
+        {
+            if (Math.Abs(k.Length - s.Length) > 1) continue;
+            var d = Lev(s, k);
+            var sc = d == 1 && k.Length == s.Length ? 92
+                   : d == 1 ? 88
+                   : d == 2 && k.Length == s.Length ? 78
+                   : d == 2 && Math.Abs(k.Length - s.Length) == 1 ? 72
+                   : 0;
+            if (sc > bestScore) { bestScore = sc; best = k; }
+        }
+        score = bestScore;
+        return best;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  持有检测
+    //   ① 实时读：装备栏 + 背包 + 兵装库（自己扫，永远最新）
+    //   ② Omni 缓存：投影台(幻化柜) / 收藏柜 / 陆行鸟鞍囊 / 雇员 / 部队箱 / 房屋仓库
+    //      —— 这些容器自己扫很麻烦（要走 UI/Agent），直接复用 OmniToolbox 已经抓好的缓存
+    // ══════════════════════════════════════════════════════════
+
+    private HashSet<uint> omniCachedOwned = [];
+    private Dictionary<uint, string> omniCachedWhere = [];
+    private DateTime omniCacheStamp = DateTime.MinValue;
+
+    private static readonly (string Field, bool IdArray)[] CacheFields =
+    [
+        ("GlamourDresserItems",  false),   // 投影台（幻化柜）
+        ("ArmoireItems",         true),    // 收藏柜（纯 ItemID 数组）
+        ("SaddlebagItems",       false),   // 陆行鸟鞍囊
+        ("RetainerItems",        false),   // 雇员仓库
+        ("RetainerMarketItems",  false),   // 雇员上架
+    ];
+
+    private static readonly (string Field, string Name)[] RootCacheFields =
+    [
+        ("FreeCompanyChestItems",           "部队箱"),
+        ("HousingInteriorStoreroomItems",   "房屋仓库"),
+        ("HousingExteriorStoreroomItems",   "庭院仓库"),
+        ("ApartmentStoreroomItems",         "公寓仓库"),
+    ];
+
+    /// <summary>读 OmniToolbox 的 InventoryCache.json（文件变了才重新解析）。</summary>
+    private void LoadOmniCache()
+    {
+        try
+        {
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "XIVLauncherCN", "pluginConfigs", "OmniToolbox", "InventoryCache.json");
+            if (!File.Exists(path)) return;
+
+            var stamp = File.GetLastWriteTimeUtc(path);
+            if (stamp == this.omniCacheStamp) return;
+            this.omniCacheStamp = stamp;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+            var ids = new HashSet<uint>();
+            var where = new Dictionary<uint, string>();
+
+            void Add(uint id, string label)
+            {
+                if (id == 0) return;
+                ids.Add(id);
+                if (where.TryGetValue(id, out var prev))
+                {
+                    if (!prev.Contains(label)) where[id] = prev + " / " + label;
+                }
+                else
+                {
+                    where[id] = label;
+                }
+            }
+
+            void Scan(JsonElement node, string field, string label, bool idArray)
+            {
+                if (!node.TryGetProperty(field, out var arr) || arr.ValueKind != JsonValueKind.Array) return;
+                foreach (var e in arr.EnumerateArray())
+                {
+                    if (idArray)
+                    {
+                        if (e.ValueKind == JsonValueKind.Number)
+                        {
+                            var id = e.GetUInt32();
+                            Add(id, label);
+                            if (field == "ArmoireItems") this.armoireItemIds.Add(id);   // 收藏柜集合
+                        }
+                    }
+                    else if (e.ValueKind == JsonValueKind.Object && e.TryGetProperty("ItemID", out var iid))
+                    {
+                        Add(iid.GetUInt32(), label);
+                    }
+                }
+            }
+
+            if (doc.RootElement.TryGetProperty("Characters", out var chars) && chars.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var c in chars.EnumerateObject())
+                {
+                    foreach (var (field, idArray) in CacheFields)
+                        Scan(c.Value, field, field switch
+                        {
+                            "GlamourDresserItems" => "投影台",
+                            "ArmoireItems" => "收藏柜",
+                            "SaddlebagItems" => "鞍囊",
+                            "RetainerItems" => "雇员",
+                            _ => "雇员上架",
+                        }, idArray);
+                }
+            }
+
+            foreach (var (field, label) in RootCacheFields)
+                Scan(doc.RootElement, field, label, false);
+
+            this.omniCachedOwned = ids;
+            this.omniCachedWhere = where;
+            DalamudServices.PluginLog.Information($"[幻化助手] Omni 缓存已载入：{ids.Count} 个道具（投影台/收藏柜/雇员/部队箱/房屋仓库）");
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 读取 Omni 缓存失败（只用实时扫描）");
+        }
+    }
+
+    /// <summary>返回持有数量（实时扫描 + Omni 缓存），并输出持有位置。</summary>
+    private unsafe int CountOwned(uint itemId, out string where)
+    {
+        where = "";
+        if (itemId == 0) return 0;
+
+        var total = 0;
+        var places = new List<string>();
+
+        try
+        {
+            var mgr = InventoryManager.Instance();
+            if (mgr != null)
+            {
+                // 包含装备栏：身上正穿的装备不在背包也不在兵装库
+                var types = new[]
+                {
+                    InventoryType.EquippedItems,
+                    InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4,
+                    InventoryType.ArmoryMainHand, InventoryType.ArmoryOffHand, InventoryType.ArmoryHead,
+                    InventoryType.ArmoryBody, InventoryType.ArmoryHands, InventoryType.ArmoryLegs,
+                    InventoryType.ArmoryFeets, InventoryType.ArmoryEar, InventoryType.ArmoryNeck,
+                    InventoryType.ArmoryWrist, InventoryType.ArmoryRings,
+                };
+                var bagCount = 0;
+                var equippedCount = 0;
+                foreach (var type in types)
+                {
+                    var cont = mgr->GetInventoryContainer(type);
+                    if (cont == null || !cont->IsLoaded) continue;
+                    for (var i = 0; i < cont->Size; i++)
+                    {
+                        var slot = cont->GetInventorySlot(i);
+                        if (slot == null || slot->ItemId == 0) continue;
+                        if (slot->ItemId != itemId) continue;
+                        var q = (int)slot->Quantity;
+                        total += q;
+                        if (type == InventoryType.EquippedItems) equippedCount += q; else bagCount += q;
+                    }
+                }
+                if (equippedCount > 0) places.Add($"已装备x{equippedCount}");
+                if (bagCount > 0) places.Add($"背包/兵装库x{bagCount}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 读取实时背包失败");
+        }
+
+        if (this.omniCachedOwned.Contains(itemId))
+        {
+            total += 1;   // 缓存里只有"有没有"，数量记 1
+            if (this.omniCachedWhere.TryGetValue(itemId, out var w)) places.Add(w);
+        }
+
+        where = string.Join(" + ", places);
+        return total;
+    }
+
+    private int CountOwned(uint itemId)
+    {
+        var n = CountOwned(itemId, out var _);
+        return n;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  获取方式（数据来自 OmniToolbox 自带的 LuminaSupplemental.Excel）
+    //    副本掉落 / 怪物掉落 / NPC 商店 / 商城 / 特殊来源（分解、宝箱、幻卡包、杂交…）
+    //    全部数据都在本地（内嵌 CSV），不发任何网络请求
+    // ══════════════════════════════════════════════════════════
+
+    private Dictionary<uint, List<string>> itemSources = [];
+    private readonly Dictionary<uint, string> storeUrls = [];   // 商城道具 → 商品页链接
+    private readonly Dictionary<uint, string> patchInfo = [];   // 道具 → "X.X 版本加入"（只进悬停）
+    private readonly HashSet<uint> cashShopItems = [];          // 商城/特典道具
+    private bool sourcesLoaded;
+
+    // 来源优先级：小的排前面（显示时先显示最有用的；分解/无法获得垫底）
+    private const int PrioPriority  = 10;   // 商城 / 特典
+    private const int PrioDungeon   = 20;   // 副本掉落
+    private const int PrioVendor    = 25;   // 金币商店购买
+    private const int PrioCraft     = 30;   // 制作
+    private const int PrioGather    = 40;   // 采集
+    private const int PrioFate      = 50;   // FATE / 雇员 / 杂交
+    private const int PrioDeep      = 55;   // 深层迷宫 / 优雷卡 / 博兹雅
+    private const int PrioMob       = 60;   // 怪物掉落
+    private const int PrioExchange  = 70;   // 用道具换取
+    private const int PrioDesynth   = 90;   // 分解 / 精炼
+    private const int PrioNone      = 99;   // 已无法获得
+
+    private unsafe void LoadItemSources()
+    {
+        if (this.sourcesLoaded) return;
+        this.sourcesLoaded = true;
+
+        var sw = Stopwatch.StartNew();
+        var raw = new Dictionary<uint, List<(int Prio, string Text)>>();
+
+        void Add(uint id, string text, int prio)
+        {
+            if (id == 0 || string.IsNullOrEmpty(text)) return;
+            if (!raw.TryGetValue(id, out var list)) { list = []; raw[id] = list; }
+            if (list.Any(x => x.Text == text)) return;
+            list.Add((prio, text));
+        }
+
+        var gd = DalamudServices.DataManager.GameData;
+        List<T> Load<T>(string res) where T : LuminaSupplemental.Excel.Model.ICsv, new()
+        {
+            try
+            {
+                return LuminaSupplemental.Excel.Services.CsvLoader.LoadResource<T>(res, true, out _, out _, gd, null) ?? [];
+            }
+            catch (Exception ex)
+            {
+                DalamudServices.PluginLog.Information(ex, $"[幻化助手] 载入 {typeof(T).Name} 失败（跳过）");
+                return [];
+            }
+        }
+
+        string SheetName<T>(uint rowId) where T : struct, Lumina.Excel.IExcelRow<T>
+        {
+            try
+            {
+                var row = DalamudServices.DataManager.GetExcelSheet<T>().GetRow(rowId);
+                return row switch
+                {
+                    Lumina.Excel.Sheets.Item i => i.Name.ToString(),
+                    Lumina.Excel.Sheets.BNpcName b => b.Singular.ToString(),
+                    Lumina.Excel.Sheets.ENpcResident e => e.Singular.ToString(),
+                    Lumina.Excel.Sheets.ContentFinderCondition c => c.Name.ToString(),
+                    Lumina.Excel.Sheets.Fate f => f.Name.ToString(),
+                    _ => rowId.ToString(),
+                };
+            }
+            catch { return rowId.ToString(); }
+        }
+
+        // ── ① 游戏本体：制作 / 采集（幻化装备最常见的来源，LuminaSupplemental 没覆盖）──
+        try
+        {
+            foreach (var r in DalamudServices.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Recipe>())
+            {
+                var resultId = r.ItemResult.RowId;
+                if (resultId != 0) Add(resultId, "制作（生产职业）", PrioCraft);
+            }
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 读 Recipe 失败"); }
+
+        try
+        {
+            foreach (var r in DalamudServices.DataManager.GetExcelSheet<Lumina.Excel.Sheets.GatheringItem>())
+            {
+                try { if (r.Item.RowId != 0) Add(r.Item.RowId, "采集（园艺/采矿/钓鱼）", PrioGather); } catch { }
+            }
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 读 GatheringItem 失败"); }
+
+        // ── ② 无法获得 ──
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.UnobtainableItem>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.UnobtainableItemResourceName))
+            Add(r.ItemId, "已无法获得", PrioNone);
+
+        // ── ③ 副本掉落 ──
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.DungeonDrop>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.DungeonDropItemResourceName))
+            Add(r.ItemId, $"副本：{SheetName<Lumina.Excel.Sheets.ContentFinderCondition>(r.ContentFinderConditionId)}", PrioDungeon);
+
+        // ── ④ 怪物掉落（同一件可能几十只怪 → 只列前 3 个 + 计数）──
+        var mobByItem = new Dictionary<uint, List<string>>();
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.MobDrop>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.MobDropResourceName))
+        {
+            var name = SheetName<Lumina.Excel.Sheets.BNpcName>(r.BNpcNameId);
+            if (!mobByItem.TryGetValue(r.ItemId, out var l)) { l = []; mobByItem[r.ItemId] = l; }
+            if (!l.Contains(name)) l.Add(name);
+        }
+        foreach (var (itemId, names) in mobByItem)
+        {
+            var head = string.Join("、", names.Take(3));
+            Add(itemId, names.Count > 3 ? $"怪物掉落：{head} 等 {names.Count} 种" : $"怪物掉落：{head}", PrioMob);
+        }
+
+        // ── ⑤ 商城 / 特典（付费道具）—— 优先级最高，因为这是最"确定"的来源 ──
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.StoreItem>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.StoreItemResourceName))
+        {
+            var price = r.PriceCentsUSD > 0 ? $"${r.PriceCentsUSD / 100.0:0.00}" : "";
+            var set = r.FittingShopItemSetId != 0 ? " · 试穿套装" : "";
+            Add(r.ItemId, string.IsNullOrEmpty(price) ? $"商城 / 特典{set}" : $"商城 / 特典（{price}）{set}", PrioPriority);
+            this.cashShopItems.Add(r.ItemId);
+            if (!string.IsNullOrWhiteSpace(r.StoreUrl)) this.storeUrls[r.ItemId] = r.StoreUrl;
+        }
+
+        // ── ⑥ FATE / 雇员探险 / 杂交 ──
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.FateItem>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.FateItemResourceName))
+            Add(r.ItemId, $"FATE：{SheetName<Lumina.Excel.Sheets.Fate>(r.FateId)}", PrioFate);
+
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.RetainerVentureItem>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.RetainerVentureItemResourceName))
+            Add(r.ItemId, "雇员探险", PrioFate);
+
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.GardeningCrossbreed>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.GardeningCrossbreedResourceName))
+            Add(r.ItemResultId, "杂交种植", PrioFate);
+
+        // ── ⑦ 特殊来源（深层迷宫 / 优雷卡 / 博兹雅 / 幻卡包 / 宝箱 …）──
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.ItemSupplement>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.ItemSupplementResourceName))
+        {
+            var (label, prio) = r.ItemSupplementSource switch
+            {
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Desynth           => ("分解获得", PrioDesynth),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Reduction         => ("精炼获得", PrioDesynth),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Loot              => ("掉落", PrioExchange),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Gardening         => ("杂交种植", PrioFate),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.SkybuilderHandIn  => ("重建上交", PrioExchange),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.CardPacks         => ("幻卡包", PrioExchange),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Coffer            => ("宝箱", PrioExchange),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.PalaceOfTheDead   => ("死者宫殿", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.HeavenOnHigh      => ("天之御柱", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.EurekaOrthos      => ("优雷卡·奥尔托斯", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Anemos            => ("优雷卡·常风", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Pagos             => ("优雷卡·恒冰", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Pyros             => ("优雷卡·涌火", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Hydatos           => ("优雷卡·丰水", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Bozja             => ("南方博兹雅战线", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Logogram          => ("记忆晶石", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.PilgrimsTraverse  => ("天佑女王·朝圣者之径", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Oizys             => ("天佑女王·奥伊西斯", PrioDeep),
+                LuminaSupplemental.Excel.Model.ItemSupplementSource.Auxesia           => ("天佑女王·奥克塞西亚", PrioDeep),
+                _ => (null, 0),
+            };
+            if (label == null) continue;
+
+            var extra = r.SourceItemId != 0
+                ? "（用「" + SheetName<Lumina.Excel.Sheets.Item>(r.SourceItemId) + "」换取）"
+                : "";
+            Add(r.ItemId, label + extra, prio);
+        }
+
+        // ── ⑧ 金币商店（子行表：每行 = 一个商店的 SubrowCollection）──
+        try
+        {
+            var gsi = DalamudServices.DataManager.GameData.Excel
+                .GetSubrowSheet<Lumina.Excel.Sheets.GilShopItem>();
+            var n = 0;
+            foreach (var row in gsi)
+            {
+                foreach (var sub in row)
+                {
+                    uint id = 0;
+                    try { id = sub.Item.RowId; } catch { }
+                    if (id == 0) continue;
+                    n++;
+                    Add(id, "金币商店可购买", PrioVendor);
+                }
+            }
+            DalamudServices.PluginLog.Information($"[幻化助手] 金币商店：{n} 条");
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 读 GilShopItem 失败"); }
+
+        // ── ⑨ 加入版本 ──
+        // 版本号单独存 —— 玩家反馈「哪版加入」不实用，不该占主显示位，只在悬停里作参考
+        foreach (var r in Load<LuminaSupplemental.Excel.Model.ItemPatch>(
+                     LuminaSupplemental.Excel.Services.CsvLoader.ItemPatchResourceName))
+        {
+            if (r.StartItemId == 0 || r.PatchNo <= 0) continue;
+            for (var id = r.StartItemId; id <= r.EndItemId; id++)
+                this.patchInfo[id] = $"{r.PatchNo:0.0} 版本加入";
+        }
+
+        // 按优先级排序后定型
+        this.itemSources = raw.ToDictionary(
+            kv => kv.Key,
+            kv => kv.Value.OrderBy(x => x.Prio).Select(x => x.Text).ToList());
+        DalamudServices.PluginLog.Information(
+            $"[幻化助手] 获取方式索引就绪：{this.itemSources.Count} 个道具，用时 {sw.ElapsedMilliseconds} ms");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  灰机wiki 获取方式（首选数据源）
+    //    数据来自 OmniToolbox.Common.dll 的内嵌资源 WikiItemSources.json
+    //    原始数据：「最终幻想XIV中文维基」https://ff14.huijiwiki.com/  (CC BY-NC-SA 3.0)
+    //    结构: items[{i:物品ID, s:[sources 数组下标]}] + sources[{c:类型, n:标题, d:详情}]
+    //    覆盖 51,227 件物品中的 44,350 件，带 NPC 名、坐标、所需材料、价格
+    // ══════════════════════════════════════════════════════════
+
+    private Dictionary<uint, List<string>> wikiTitles = [];     // 物品 → 来源标题（主显示）
+    private Dictionary<uint, List<string>> wikiDetails = [];    // 物品 → 来源详情（悬停）
+    private bool wikiLoaded;
+
+    private void LoadWikiSources()
+    {
+        if (this.wikiLoaded) return;
+        this.wikiLoaded = true;
+        var sw = Stopwatch.StartNew();
+
+        try
+        {
+            var asm = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "OmniToolbox.Common");
+            using var st = asm?.GetManifestResourceStream("OmniToolbox.Data.WikiItemSources.json");
+            if (st == null)
+            {
+                DalamudServices.PluginLog.Information("[幻化助手] 未找到 wiki 资源（OmniToolbox.Common 版本可能不同）");
+                return;
+            }
+
+            using var reader = new StreamReader(st, Encoding.UTF8);
+            using var doc = JsonDocument.Parse(reader.ReadToEnd());
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("sources", out var srcArr) || !root.TryGetProperty("items", out var itemArr))
+                return;
+
+            var srcs = new List<(string N, string D)>(srcArr.GetArrayLength());
+            foreach (var e in srcArr.EnumerateArray())
+            {
+                var n = e.TryGetProperty("n", out var nn) ? nn.GetString() ?? "" : "";
+                var d = e.TryGetProperty("d", out var dd) ? dd.GetString() ?? "" : "";
+                srcs.Add((n, d));
+            }
+
+            foreach (var it in itemArr.EnumerateArray())
+            {
+                if (!it.TryGetProperty("i", out var idEl) || !it.TryGetProperty("s", out var sArr)) continue;
+                var id = idEl.GetUInt32();
+                var titles = new List<string>();
+                var details = new List<string>();
+                foreach (var si in sArr.EnumerateArray())
+                {
+                    var idx = si.GetInt32();
+                    if (idx < 0 || idx >= srcs.Count) continue;
+                    var (n, d) = srcs[idx];
+                    if (string.IsNullOrWhiteSpace(n)) continue;
+                    if (!titles.Contains(n)) titles.Add(n);
+                    if (!string.IsNullOrWhiteSpace(d) && !details.Contains(d)) details.Add(d);
+                }
+                if (titles.Count > 0)
+                {
+                    this.wikiTitles[id] = titles;
+                    this.wikiDetails[id] = details;
+                }
+            }
+
+            DalamudServices.PluginLog.Information(
+                $"[幻化助手] wiki 获取方式就绪：{this.wikiTitles.Count} 个道具 / {srcs.Count} 条来源，用时 {sw.ElapsedMilliseconds} ms");
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 载入 wiki 获取方式失败（退回本地聚合）");
+        }
+    }
+
+    /// <summary>取某道具的获取方式（wiki 优先，本地聚合兜底）。</summary>
+    private List<string> GetSources(uint itemId)
+    {
+        if (!this.config.ShowSources) return [];
+        LoadWikiSources();
+        LoadItemSources();
+
+        var list = new List<string>();
+        if (this.wikiTitles.TryGetValue(itemId, out var w)) list.AddRange(w);
+        if (this.itemSources.TryGetValue(itemId, out var l))
+            foreach (var s in l) if (!list.Contains(s)) list.Add(s);
+        return list;
+    }
+
+    /// <summary>取某道具的获取方式详情（wiki 的 d 字段：商店名 / 所需材料 / 坐标）。</summary>
+    private List<string> GetSourceDetails(uint itemId)
+    {
+        if (!this.config.ShowSources) return [];
+        LoadWikiSources();
+        return this.wikiDetails.TryGetValue(itemId, out var d) ? d : [];
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  写入游戏内「幻化模板」（投影模板）
+    //    通过游戏自身的幻化模板 Agent 写入，职业/部位校验由游戏负责。
+    //    流程：
+    //      ① 幻化模板编辑器必须已打开（AgentMiragePrismMiragePlate 活跃）
+    //      ② 逐槽位：agent->Data->SelectedItemIndex = 目标槽
+    //                agent->SetSelectedItemData(PrismBox, 投影台下标, 道具ID, 染剂1, 染剂2)
+    //      ③ 提交后由游戏自己保存（或玩家点保存）
+    //    前置条件（游戏规则，不是我们能绕的）：
+    //      · 装备必须已在投影台（幻化柜）里
+    //      · 必须在安全区
+    // ══════════════════════════════════════════════════════════
+
+    /// <summary>幻化模板的 12 个槽位（顺序与游戏「幻化模板」界面一致）。</summary>
+    private static readonly string[] PlateSlotNames =
+        ["主手", "副手", "头部", "上衣", "手部", "腿部", "脚部", "耳坠", "项链", "手镯", "戒指1", "戒指2"];
+
+    private int targetPlate = 1;            // 目标模板号 1..20
+    private string plateStatus = "";
+    private readonly Dictionary<uint, int> prismBoxIndex = [];   // 道具ID → 投影台内下标
+    private readonly HashSet<uint> armoireItemIds = [];          // 收藏柜里的道具ID
+    private Dictionary<uint, uint>? cabinetIdByItem;             // 道具ID → 收藏柜柜位ID（Cabinet 表行号，不是道具ID！）
+    private int plateWriteDone, plateWriteSkipped, plateWriteNoDye;
+
+    /// <summary>一个槽位的写入任务（两阶段：先放道具，等游戏生效后再设染剂）。</summary>
+    private struct PlateJob
+    {
+        public int Slot;          // 幻化模板槽位 0..11
+        public uint ItemId;
+        public byte Stain0, Stain1;
+        public int SourceKind;    // 1 = 投影台，2 = 收藏柜
+        public uint SourceId;     // 投影台内下标 / 收藏柜道具ID
+        public int Stage;         // 0=已发放入请求 1=设染剂0 2=设染剂1 3=完成
+        public int Tries;         // 等游戏生效的重试次数
+    }
+
+    private readonly Queue<PlateJob> plateQueue = new();
+    private PlateJob? plateCurrent;           // 正在处理的槽位（null = 空闲）
+    private int plateOpenTries;               // 自动打开幻化模板界面的等待计数
+    private int armoireQueued;                // 本批走了收藏柜的数量
+    private int cabinetFallback;              // 柜位ID兜底次数
+    private int notInContainer;               // 两个容器都没有的数量
+    private bool plateIndexSet;               // 本批次是否已把编辑器切到目标模板
+    private int applyStage = -1;              // 应用模板的分帧状态机（-1 = 空闲）
+    private int applyTarget = 1;
+    private int applyWait;                    // 等待模板数据加载的帧计数
+
+    /// <summary>我们识别的槽位名 → 幻化模板槽位下标（不适用返回 -1）。</summary>
+    private static int PlateSlotIndexOf(string slot) => slot switch
+    {
+        "主手" => 0, "副手" => 1, "头部" => 2, "上衣" => 3,
+        "手部" => 4, "腿部" => 5, "脚部" => 6, "耳坠" => 7,
+        "项链" => 8, "手镯" => 9, "戒指" => 10,
+        _ => -1,
+    };
+
+    /// <summary>从 Omni 缓存里建「道具ID → 投影台下标」映射（写模板必须要下标）。</summary>
+    private void LoadPrismBoxIndex()
+    {
+        if (this.prismBoxIndex.Count > 0) return;
+        try
+        {
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "XIVLauncherCN", "pluginConfigs", "OmniToolbox", "InventoryCache.json");
+            if (!File.Exists(path)) return;
+            using var doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+            if (!doc.RootElement.TryGetProperty("Characters", out var chars)) return;
+            foreach (var c in chars.EnumerateObject())
+            {
+                if (!c.Value.TryGetProperty("GlamourDresserItems", out var arr)) continue;
+                foreach (var e in arr.EnumerateArray())
+                {
+                    if (e.ValueKind != JsonValueKind.Object) continue;
+                    if (!e.TryGetProperty("ItemID", out var iid)) continue;
+                    var slot = e.TryGetProperty("SlotIndex", out var si) ? si.GetInt32() : -1;
+                    if (slot >= 0) this.prismBoxIndex[iid.GetUInt32()] = slot;
+                }
+            }
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 读投影台下标失败"); }
+    }
+
+    /// <summary>建「道具ID → 收藏柜柜位ID」索引（游戏要的是柜位ID，不是道具ID）。</summary>
+    private unsafe void LoadCabinetIdsIfNeeded()
+    {
+        if (this.cabinetIdByItem != null) return;
+        var map = new Dictionary<uint, uint>();
+        try
+        {
+            var sheet = DalamudServices.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Cabinet>();
+            foreach (var row in sheet)
+            {
+                if (row.RowId == 0) continue;
+                try
+                {
+                    var iid = row.Item.RowId;
+                    if (iid != 0 && !map.ContainsKey(iid)) map[iid] = row.RowId;
+                }
+                catch { }
+            }
+            DalamudServices.PluginLog.Information($"[幻化助手] 收藏柜柜位索引就绪：{map.Count} 个道具");
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 读 Cabinet 表失败"); }
+        this.cabinetIdByItem = map;
+    }
+
+    /// <summary>把识别结果排进写入队列。</summary>
+    private void QueuePlateWrite()
+    {
+        LoadPrismBoxIndex();
+        this.plateQueue.Clear();
+        this.plateCurrent = null;
+        this.plateWriteDone = 0;
+        this.plateWriteSkipped = 0;
+        this.plateWriteNoDye = 0;
+        this.plateIndexSet = false;
+        this.armoireQueued = 0;
+        this.cabinetFallback = 0;
+        this.notInContainer = 0;
+
+        foreach (var r in this.results)
+        {
+            var slot = PlateSlotIndexOf(r.Slot);
+            if (slot < 0) { this.plateWriteSkipped++; continue; }      // 副手/戒指等特例
+            int srcKind; uint srcId;
+            if (this.prismBoxIndex.TryGetValue(r.ItemId, out var boxIndex))
+            {
+                srcKind = 1; srcId = (uint)boxIndex;                   // 投影台（幻化柜）
+            }
+            else if (this.armoireItemIds.Contains(r.ItemId))
+            {
+                LoadCabinetIdsIfNeeded();
+                if (this.cabinetIdByItem != null && this.cabinetIdByItem.TryGetValue(r.ItemId, out var cabId))
+                {
+                    srcKind = 2; srcId = cabId;                        // 收藏柜：柜位ID
+                }
+                else
+                {
+                    // 兜底：查不到柜位ID 时退回用道具ID（并记日志，便于定位）
+                    srcKind = 2; srcId = r.ItemId;
+                    this.cabinetFallback++;
+                    DalamudServices.PluginLog.Information(
+                        $"[幻化助手] 收藏柜：道具 {r.ItemId} 查不到柜位ID，退回用道具ID");
+                }
+                this.armoireQueued++;
+            }
+            else
+            {
+                this.notInContainer++;                                 // 两个容器里都没有
+                continue;
+            }
+            byte s0 = 0, s1 = 0;
+            var dyes = r.Dyes.Where(d => !d.IsEmpty).Take(2).ToList();
+            if (dyes.Count > 0 && dyes[0].Id < 256) s0 = (byte)dyes[0].Id;
+            if (dyes.Count > 1 && dyes[1].Id < 256) s1 = (byte)dyes[1].Id;
+            this.plateQueue.Enqueue(new PlateJob
+            {
+                Slot = slot, ItemId = r.ItemId, Stain0 = s0, Stain1 = s1,
+                SourceKind = srcKind, SourceId = srcId,
+            });
+        }
+
+        var detail = new List<string>();
+        if (this.armoireQueued > 0) detail.Add($"收藏柜 {this.armoireQueued} 件");
+        if (this.notInContainer > 0) detail.Add($"{this.notInContainer} 件两个容器里都没有");
+        if (this.plateWriteSkipped - this.notInContainer > 0) detail.Add($"{this.plateWriteSkipped - this.notInContainer} 件槽位不支持");
+        if (this.cabinetFallback > 0) detail.Add($"{this.cabinetFallback} 件柜位ID用兜底值");
+        var tail = detail.Count > 0 ? "（" + string.Join("，", detail) + "）" : "";
+
+        this.plateStatus = this.plateQueue.Count > 0
+            ? $"准备写入 {this.plateQueue.Count} 件到模板 {this.targetPlate}{tail}"
+            : $"没有可写入的槽位{tail} —— 需先把装备放进投影台或收藏柜。";
+        DalamudServices.PluginLog.Information($"[幻化助手] 排队完成：{this.plateStatus}");
+    }
+
+    /// <summary>
+    /// 每帧推进一步（不要在同一帧连续调 Agent）。
+    /// 流程：① 选中槽位 + 放道具 → ② 下一帧确认游戏已生效 → ③ 逐槽设染剂。
+    /// 染剂用 SetItemStain，需要「染剂道具在背包里的指针」；没有那瓶染剂就跳过该染剂。
+    /// </summary>
+    private unsafe void TickPlateWrite()
+    {
+        if (this.plateCurrent == null && this.plateQueue.Count == 0) return;
+
+        var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismMiragePlate.Instance();
+        // 就绪判定：Agent 活跃 + Data 可读。
+        // addon 可见性只写进日志做诊断，不作为阻断条件（之前拿它当门槛导致把自己堵死）。
+        var addonState = "?";
+        try
+        {
+            var atm = FFXIVClientStructs.FFXIV.Client.UI.RaptureAtkUnitManager.Instance();
+            var unit = atm != null ? atm->GetAddonByName("MiragePrismMiragePlate") : null;
+            addonState = unit == null ? "无" : (unit->IsVisible ? "可见" : "存在但不可见");
+        }
+        catch { }
+
+        var ready = agent != null && agent->IsAgentActive() && agent->Data != null;
+
+        if (!ready)
+        {
+            // 界面没开 → 自动尝试打开一次，等 3 秒；失败就提示手动打开，但不阻断
+            if (this.plateOpenTries == 0)
+            {
+                OmenTools.Interop.Game.ExecuteCommand.Implementations.GlamourPlateCommand.Enter();
+                DalamudServices.PluginLog.Information($"[幻化助手] 尝试自动打开幻化模板界面（Enter）addon={addonState}");
+            }
+            this.plateOpenTries++;
+            if (this.plateOpenTries > 180)
+            {
+                this.plateStatus =
+                    $"幻化模板界面没打开（addon={addonState}）—— 请在游戏里手动打开「幻化模板」界面（要站在投影台前），再点「写入模板」。";
+                DalamudServices.PluginLog.Information($"[幻化助手] 自动打开失败 addon={addonState}，请手动打开");
+                this.plateQueue.Clear();
+                this.plateCurrent = null;
+                this.plateOpenTries = 0;
+            }
+            else
+            {
+                this.plateStatus = $"正在打开幻化模板界面…（addon={addonState}）";
+            }
+            return;
+        }
+
+        this.plateOpenTries = 0;
+
+        // 关键：写入是写进「编辑器当前指向的那套模板」，所以必须先切到目标模板
+        if (!this.plateIndexSet)
+        {
+            var target = (uint)Math.Clamp(this.targetPlate - 1, 0, 19);
+            agent->Data->SelectedMiragePlateIndex = target;
+            this.plateIndexSet = true;
+            this.plateStatus = $"已把幻化模板编辑器切到模板 {this.targetPlate}，下一帧开始写入…";
+            DalamudServices.PluginLog.Information(
+                $"[幻化助手] 编辑器切到模板 {this.targetPlate}（index={target}），addon={addonState}");
+            return;   // 等一帧让游戏应用切换
+        }
+
+        if (this.plateCurrent == null && this.plateQueue.Count > 0)
+            DalamudServices.PluginLog.Information(
+                $"[幻化助手] 开始写入：agent 活跃，addon={addonState}，待写 {this.plateQueue.Count} 件，目标模板 {this.targetPlate}");
+
+        // ── 取下一个任务：发放入请求 ──
+        if (this.plateCurrent == null)
+        {
+            var job = this.plateQueue.Dequeue();
+            agent->Data->SelectedItemIndex = (uint)job.Slot;
+            agent->SetSelectedItemData(
+                (FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismMiragePlateData.ItemSource)job.SourceKind,
+                job.SourceId,
+                job.ItemId,
+                job.Stain0,
+                job.Stain1);
+            agent->Data->HasChanges = true;
+            job.Stage = 0;
+            this.plateCurrent = job;
+            return;   // 等下一帧看游戏有没有真的写进去
+        }
+
+        var cur = this.plateCurrent.Value;
+        ref var slotItem = ref agent->Data->CurrentItems[cur.Slot];
+
+        switch (cur.Stage)
+        {
+            case 0:
+                // 等游戏把道具写进这个槽位（最多等 30 帧，避免卡死）
+                if (slotItem.ItemId == 0)
+                {
+                    cur.Tries++;
+                    if (cur.Tries > 30)
+                    {
+                        this.plateWriteSkipped++;
+                        this.plateCurrent = null;
+                        return;
+                    }
+                    this.plateCurrent = cur;
+                    return;
+                }
+                cur.Stage = 1;
+                this.plateCurrent = cur;
+                this.plateWriteDone++;
+                DalamudServices.PluginLog.Information(
+                    $"[幻化助手] 槽位 {cur.Slot} 道具已进模板（itemId={slotItem.ItemId}）");
+                return;
+
+            case 1:   // 染剂槽 1
+                if (cur.Stain0 != 0)
+                {
+                    var (cnt, _, ptr, dyeId) = FindDyeItem(cur.Stain0);
+                    if (cnt > 0 && ptr != 0)
+                    {
+                        slotItem.Flags = (FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismMiragePlateData.ItemFlag)((uint)slotItem.Flags | 1u);
+                        agent->SetItemStain((uint)cur.Slot, cur.Stain0, (FFXIVClientStructs.FFXIV.Client.Game.InventoryItem*)ptr, dyeId, 0);
+                    }
+                    else
+                    {
+                        this.plateWriteNoDye++;
+                    }
+                }
+                cur.Stage = 2;
+                this.plateCurrent = cur;
+                return;
+
+            case 2:   // 染剂槽 2
+                if (cur.Stain1 != 0)
+                {
+                    var (cnt2, _, ptr2, dyeId2) = FindDyeItem(cur.Stain1);
+                    if (cnt2 > 0 && ptr2 != 0)
+                    {
+                        slotItem.Flags = (FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismMiragePlateData.ItemFlag)((uint)slotItem.Flags | 0x20u);
+                        agent->SetItemStain((uint)cur.Slot, cur.Stain1, (FFXIVClientStructs.FFXIV.Client.Game.InventoryItem*)ptr2, dyeId2, 1);
+                    }
+                    else
+                    {
+                        this.plateWriteNoDye++;
+                    }
+                }
+                agent->Data->HasChanges = true;
+                agent->CharaView.IsUpdatePending = true;
+                this.plateCurrent = null;
+
+                var left = this.plateQueue.Count;
+                this.plateStatus = left > 0
+                    ? $"写入中… 已处理 {this.plateWriteDone} 件（含染剂），剩 {left} 件"
+                    : $"已写入 {this.plateWriteDone} 件到模板 {this.targetPlate}"
+                      + (this.plateWriteNoDye > 0 ? $"，另有 {this.plateWriteNoDye} 个染剂因背包里没有对应染剂而跳过" : "")
+                      + (this.plateWriteSkipped > 0 ? $"，{this.plateWriteSkipped} 件因不在投影台而跳过" : "")
+                      + "。请在游戏里点「保存」，或直接点「应用模板」。";
+                return;
+        }
+    }
+
+    /// <summary>请求应用（穿上）第 N 套幻化模板 —— 真正的指令由每帧 TickApplyPlate 分帧发出。</summary>
+    private void ApplyPlate(int plateIndex)
+    {
+        this.applyTarget = Math.Clamp(plateIndex, 1, 20);
+        this.applyStage = 0;
+        this.plateStatus = $"准备应用幻化模板 {this.applyTarget}…";
+        DalamudServices.PluginLog.Information($"[幻化助手] 请求应用模板 {this.applyTarget}");
+    }
+
+    /// <summary>
+    /// 分帧发送应用指令 —— Enter / ApplyPlate / Exit 每条占一帧。
+    /// 挤在同一帧发会掉指令（这是之前"应用失效"的原因）。
+    /// </summary>
+    private unsafe void TickApplyPlate()
+    {
+        if (this.applyStage < 0) return;
+        try
+        {
+            switch (this.applyStage)
+            {
+                // 投影需要先进入幻化模板上下文：Enter → ApplyPlate → Exit。
+                //   拆成多帧发送，避免与写入争用同一帧的指令队列。
+                // 投影台以外模板数据可能未加载，此时直接投影会被游戏忽略 → 先请求加载。
+                case 0:
+                    var mm = FFXIVClientStructs.FFXIV.Client.Game.MirageManager.Instance();
+                    var loaded = mm != null && mm->GlamourPlatesLoaded;
+                    DalamudServices.PluginLog.Information($"[幻化助手] 应用流程开始：GlamourPlatesLoaded={loaded}");
+                    if (!loaded)
+                    {
+                        OmenTools.Interop.Game.ExecuteCommand.Implementations.GlamourPlateCommand.Request();
+                        this.applyWait = 0;
+                        this.plateStatus = "正在加载幻化模板数据…";
+                        this.applyStage = 10;
+                    }
+                    else
+                    {
+                        this.applyStage = 1;
+                    }
+                    break;
+
+                // 等模板数据加载（最多约 2 秒），加载好或超时都继续走投影
+                case 10:
+                    this.applyWait++;
+                    var mm2 = FFXIVClientStructs.FFXIV.Client.Game.MirageManager.Instance();
+                    if ((mm2 != null && mm2->GlamourPlatesLoaded) || this.applyWait > 120)
+                    {
+                        DalamudServices.PluginLog.Information(
+                            $"[幻化助手] 模板数据加载{(mm2 != null && mm2->GlamourPlatesLoaded ? "完成" : "超时")}（等了 {this.applyWait} 帧），开始投影");
+                        this.applyStage = 1;
+                    }
+                    break;
+
+                // 附加调用游戏原生的 OpenForGearset
+                case 1:
+                    // 附加尝试：原生 OpenForGearset（仅作补充，命令路径仍为主）
+                    try
+                    {
+                        var plateAgent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismMiragePlate.Instance();
+                        if (plateAgent != null && plateAgent->IsAgentActive())
+                        {
+                            plateAgent->OpenForGearset(-1, this.applyTarget - 1, 0);
+                            DalamudServices.PluginLog.Information(
+                                $"[幻化助手] 附带调用 OpenForGearset(gearset=-1, 模板={this.applyTarget - 1})");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        DalamudServices.PluginLog.Information(ex, "[幻化助手] OpenForGearset 调用异常（忽略）");
+                    }
+
+                    // 继续走命令路径
+                    OmenTools.Interop.Game.ExecuteCommand.Implementations.GlamourPlateCommand.Enter();
+                    this.plateStatus = "进入幻化模板上下文…";
+                    this.applyStage = 4;
+                    break;
+
+                case 4:
+                    this.applyStage = 5;      // 等一帧让上下文生效
+                    break;
+
+                case 5:
+                    OmenTools.Interop.Game.ExecuteCommand.Implementations.GlamourPlateCommand
+                        .ApplyPlate((uint)(this.applyTarget - 1));
+                    DalamudServices.PluginLog.Information($"[幻化助手] 已发送 ApplyPlate({this.applyTarget - 1})");
+                    this.applyStage = 6;
+                    break;
+
+                case 6:
+                    OmenTools.Interop.Game.ExecuteCommand.Implementations.GlamourPlateCommand.Exit();
+                    this.applyStage = -1;
+                    this.plateStatus = $"已发送投影指令（模板 {this.applyTarget}）。";
+                    DalamudServices.PluginLog.Information($"[幻化助手] 模板 {this.applyTarget} 应用流程完成（Enter→Apply→Exit）");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            this.applyStage = -1;
+            this.plateStatus = "应用模板失败：" + ex.Message;
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 应用模板异常");
+        }
+    }
+
+    /// <summary>幻化模板编辑器是否已就绪（Agent 活跃 + Data 可读）。</summary>
+    private unsafe bool IsPlateEditorReady()
+    {
+        try
+        {
+            var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismMiragePlate.Instance();
+            return agent != null && agent->IsAgentActive() && agent->Data != null;
+        }
+        catch { return false; }
+    }
+
+    private void DrawPlateSection()
+    {
+        if (this.results.Count == 0) return;
+
+        ImGui.Spacing();
+        ImGui.TextUnformatted("③ 写入幻化模板");
+        ImGui.SameLine();
+        ImGui.TextDisabled("（把识别到的 8 件 + 染剂写进游戏自己的幻化模板）");
+
+        ImGui.SetNextItemWidth(90 * ImGuiHelpers.GlobalScale);
+        if (ImGui.InputInt("目标模板###plateNo", ref this.targetPlate))
+            this.targetPlate = Math.Clamp(this.targetPlate, 1, 20);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("幻化模板编号 1 ~ 20（输入后按回车确认）");
+
+        ImGui.SameLine();
+        if (ImGui.Button("写入模板")) QueuePlateWrite();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("把识别到的装备 + 染剂写入目标模板\n（需要先在游戏里打开投影台的「幻化模板」界面）");
+
+        ImGui.SameLine();
+        if (ImGui.Button("应用模板")) ApplyPlate(this.targetPlate);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("投影（穿上）目标模板");
+
+        if (!string.IsNullOrEmpty(this.plateStatus))
+            ImGui.TextWrapped(this.plateStatus);
+
+        // 前置条件提示（游戏规则限制）
+        this.LoadPrismBoxIndexIfNeeded();
+        if (this.prismBoxIndex.Count > 0 || this.armoireItemIds.Count > 0)
+        {
+            var inDresser = this.results.Count(r => this.prismBoxIndex.ContainsKey(r.ItemId));
+            var inArmoire = this.results.Count(r => !this.prismBoxIndex.ContainsKey(r.ItemId) && this.armoireItemIds.Contains(r.ItemId));
+            var canWrite = inDresser + inArmoire;
+            ImGui.TextDisabled(
+                $"容器校验：识别到 {this.results.Count} 件 —— 投影台 {inDresser} 件 + 收藏柜 {inArmoire} 件 = 可写入 {canWrite} 件"
+                + (canWrite < this.results.Count
+                    ? $"（另 {this.results.Count - canWrite} 件两个容器里都没有，需先放进投影台或收藏柜）"
+                    : "（全部可写入）"));
+        }
+    }
+
+    private void LoadPrismBoxIndexIfNeeded()
+    {
+        if (this.prismBoxIndex.Count == 0) LoadPrismBoxIndex();
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  染剂持有检测（含「染剂合并」处理）
+    //    ★ FF14 把染剂合并过：同一个颜色可能对应多个道具，而且 Stain 表的
+    //      Item 字段本身是**数组**（长度 2）。必须把所有非零项都查一遍，
+    //      否则只认 Item[0] 会漏掉「特制XX染剂」。
+    //    例：煤玉黑 -> [#13115 煤玉黑染剂, #8733 特制煤玉黑染剂]
+    //        素雪白 -> [#52254 通用染剂]                （合并成通用染剂）
+    //        追加染剂 1/2 = #52255 / #52256
+    // ══════════════════════════════════════════════════════════
+
+    private Dictionary<uint, List<uint>>? dyeItemsByStain;   // 染剂ID → 可能的道具ID列表
+    private readonly Dictionary<uint, (int Count, string Detail)> dyeOwnedCache = [];
+
+    /// <summary>建「染剂ID → 道具ID列表」索引（把 Stain.Item 数组里所有非零项都收进来）。</summary>
+    private unsafe void LoadDyeItemsIfNeeded()
+    {
+        if (this.dyeItemsByStain != null) return;
+        var map = new Dictionary<uint, List<uint>>();
+        try
+        {
+            var sheet = DalamudServices.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Stain>();
+            foreach (var s in sheet)
+            {
+                if (s.RowId == 0) continue;
+                var ids = new List<uint>();
+                try
+                {
+                    foreach (var iref in s.Item)
+                    {
+                        var iid = iref.RowId;
+                        if (iid != 0) ids.Add(iid);
+                    }
+                }
+                catch { }
+                map[s.RowId] = ids;
+            }
+            DalamudServices.PluginLog.Information($"[幻化助手] 染剂道具索引就绪：{map.Count} 个染剂");
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 读 Stain 表失败"); }
+        this.dyeItemsByStain = map;
+    }
+
+    /// <summary>
+    /// 查某染剂的可染色道具在背包/幻化柜等处总共持有多少，
+    /// 并返回可用于写入模板的那个道具指针（没有则 0）。
+    /// </summary>
+    private unsafe (int Count, string Detail, nint ItemPtr, uint ItemId) FindDyeItem(uint stainId)
+    {
+        LoadDyeItemsIfNeeded();
+        var candidates = this.dyeItemsByStain!.TryGetValue(stainId, out var l) ? l : [];
+        if (candidates.Count == 0) return (0, "该颜色没有对应染剂道具", 0, 0);
+
+        var nameOf = new Func<uint, string>(id =>
+        {
+            try { return DalamudServices.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRow(id).Name.ToString(); }
+            catch { return "#" + id; }
+        });
+
+        var total = 0;
+        var details = new List<string>();
+        nint foundPtr = 0;
+        uint foundId = 0;
+
+        // ① 实时扫背包（能拿到指针，写入模板要用）
+        var mgr = InventoryManager.Instance();
+        if (mgr != null)
+        {
+            foreach (var type in new[]
+            {
+                InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4,
+            })
+            {
+                var cont = mgr->GetInventoryContainer(type);
+                if (cont == null || !cont->IsLoaded) continue;
+                for (var i = 0; i < cont->Size; i++)
+                {
+                    var slot = cont->GetInventorySlot(i);
+                    if (slot == null || slot->ItemId == 0) continue;
+                    if (!candidates.Contains(slot->ItemId)) continue;
+                    total += (int)slot->Quantity;
+                    var nm = nameOf(slot->ItemId);
+                    if (!details.Any(d => d.StartsWith(nm))) details.Add($"{nm} x{slot->Quantity}");
+                    if (foundPtr == 0) { foundPtr = (nint)slot; foundId = slot->ItemId; }
+                }
+            }
+        }
+
+        // ② Omni 缓存（雇员/幻化柜等 —— 那里有染剂但拿不到指针）
+        if (this.omniCachedOwned.Count > 0)
+        {
+            foreach (var id in candidates)
+            {
+                if (!this.omniCachedOwned.Contains(id)) continue;
+                var nm = nameOf(id);
+                if (!details.Any(d => d.StartsWith(nm))) details.Add($"{nm} x?（别处）");
+                total += 1;
+            }
+        }
+
+        return (total, details.Count > 0 ? string.Join(" / ", details) : "", foundPtr, foundId);
+    }
+
+    /// <summary>染剂列用：持有数量（带缓存，避免每帧重扫背包）。</summary>
+    private (int Count, string Detail) DyeOwned(uint stainId)
+    {
+        if (this.dyeOwnedCache.TryGetValue(stainId, out var v)) return v;
+        var r = FindDyeItem(stainId);
+        v = (r.Count, r.Detail);
+        this.dyeOwnedCache[stainId] = v;
+        return v;
+    }
+
+    /// <summary>
+    /// 本套幻化里有几处需要**同一个染剂道具**（按道具集合判定，不按颜色 —— 因为「通用染剂」
+    /// 一瓶能染多种颜色，按颜色算会重复计数）。
+    /// </summary>
+    private int CountSharedDye(uint stainId)
+    {
+        LoadDyeItemsIfNeeded();
+        if (this.dyeItemsByStain == null || !this.dyeItemsByStain.TryGetValue(stainId, out var mine) || mine.Count == 0)
+            return 1;
+        var key = string.Join(",", mine.OrderBy(x => x));
+
+        var n = 0;
+        foreach (var r in this.results)
+        {
+            foreach (var dd in r.Dyes)
+            {
+                if (dd.IsEmpty) continue;
+                if (!this.dyeItemsByStain.TryGetValue(dd.Id, out var other) || other.Count == 0) continue;
+                if (string.Join(",", other.OrderBy(x => x)) == key) n++;
+            }
+        }
+        return Math.Max(n, 1);
+    }
+
+    /// <summary>染剂悬停提示：色号 / 对应染剂道具（含合并后的通用·追加·特制）/ 持有数量。</summary>
+    private string BuildDyeTooltip(DyeResult d, (int Count, string Detail) own)
+    {
+        LoadDyeItemsIfNeeded();
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"颜色：{d.Name}（色号 {d.Id}）");
+        if (d.NeedsReview) sb.AppendLine($"识别把握：{d.Score} 分（不确定，可点行尾「改」修正）");
+
+        var items = this.dyeItemsByStain!.TryGetValue(d.Id, out var l) ? l : [];
+        if (items.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"所需染剂道具（持有任意一瓶即可染出这个颜色）：");
+            foreach (var id in items)
+            {
+                string nm;
+                try { nm = DalamudServices.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRow(id).Name.ToString(); }
+                catch { nm = "未知"; }
+                var uni = nm.Contains("通用染剂") || nm.Contains("追加染剂");
+                sb.AppendLine($"  · {nm}  #{id}" + (uni ? "（通用/追加染剂：一瓶可染多种颜色）" : ""));
+            }
+        }
+        else
+        {
+            sb.AppendLine();
+            sb.AppendLine("（这个颜色在游戏数据里没有对应染剂道具）");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine(own.Count > 0 ? $"持有：{own.Detail}  共 {own.Count}" : "持有：没有 —— 需要先获得上面任一瓶染剂");
+
+        // 同一个染剂道具被多处共用（尤其是「通用染剂」一瓶能染多种颜色）—— 别按颜色重复算
+        var shared = CountSharedDye(d.Id);
+        if (shared > 1)
+            sb.AppendLine($"本套幻化里有 {shared} 处用得上这个染剂 —— 同一瓶可重复使用，不需要买 {shared} 瓶。");
+
+        if (d.IsEmpty)
+        {
+            sb.AppendLine();
+            sb.AppendLine("这一格是「无染色」（装备可染色但没设颜色），写入模板时会保持无染色。");
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+    /// <summary>把脚本的失败原因翻译成人话</summary>
+    private static string DescribeScriptFailure(string outp)
+    {
+        if (outp.Contains("NOLANG"))
+            return "系统里没有中文 OCR 语言包。请到「设置 > 时间和语言 > 语言 > 中文(简体) > 语言选项」添加「光学字符识别」。";
+        if (outp.Contains("NOIMAGE"))
+            return "剪贴板里没有图片。先截图（或复制图片），再点这个按钮。";
+        if (string.IsNullOrWhiteSpace(outp))
+            return $"（脚本无输出，请看 {Path.Combine(WorkDir(), "last_error.txt")}）";
+        return outp;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  索引 / 工具
+    // ══════════════════════════════════════════════════════════
+
+    private void BuildIndexIfNeeded()
+    {
+        if (this.itemByName != null) return;
+
+        var map = new Dictionary<string, (uint Id, uint Icon, string Slot, bool Untradable)>();
+        var slotSheet = DalamudServices.DataManager.GetExcelSheet<EquipSlotCategory>();
+        foreach (var it in DalamudServices.DataManager.GetExcelSheet<Item>())
+        {
+            if (it.RowId == 0 || it.EquipSlotCategory.RowId == 0) continue;
+            var n = it.Name.ToString();
+            if (string.IsNullOrWhiteSpace(n) || map.ContainsKey(n)) continue;
+            map[n] = (it.RowId, it.Icon, DescribeSlot(slotSheet.GetRow(it.EquipSlotCategory.RowId)), it.IsUntradable);
+        }
+        this.itemByName = map;
+
+        var stains = new Dictionary<string, uint>();
+        foreach (var s in DalamudServices.DataManager.GetExcelSheet<Stain>())
+        {
+            if (s.RowId == 0) continue;
+            var n = s.Name.ToString();
+            if (string.IsNullOrWhiteSpace(n) || stains.ContainsKey(n)) continue;
+            stains[n] = s.RowId;
+        }
+        this.stainByName = stains;
+        this.dyeLex = stains.Keys.Where(k => k.Length >= 2).OrderByDescending(k => k.Length).ToList();
+
+        DalamudServices.PluginLog.Information($"[幻化助手] 索引就绪：装备 {map.Count} / 染剂 {stains.Count}");
+    }
+
+    private static string DescribeSlot(EquipSlotCategory s)
+    {
+        if (s.MainHand != 0) return "主手";
+        if (s.OffHand != 0) return "副手";
+        if (s.Head != 0) return "头部";
+        if (s.Body != 0) return "上衣";
+        if (s.Gloves != 0) return "手部";
+        if (s.Legs != 0) return "腿部";
+        if (s.Feet != 0) return "脚部";
+        if (s.Ears != 0) return "耳坠";
+        if (s.Neck != 0) return "项链";
+        if (s.Wrists != 0) return "手镯";
+        return "戒指";
+    }
+
+    private static string StripNoise(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (var c in s)
+        {
+            if (char.IsWhiteSpace(c)) continue;
+            if ("ZØ囗口0O".IndexOf(c) >= 0) continue;
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    private static int Lev(string a, string b)
+    {
+        int n = a.Length, m = b.Length;
+        var d = new int[n + 1, m + 1];
+        for (var i = 0; i <= n; i++) d[i, 0] = i;
+        for (var j = 0; j <= m; j++) d[0, j] = j;
+        for (var i = 1; i <= n; i++)
+            for (var j = 1; j <= m; j++)
+                d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1),
+                                   d[i - 1, j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1));
+        return d[n, m];
+    }
+
+    private string BuildClipboardText()
+    {
+        var sb = new StringBuilder();
+        foreach (var r in this.results)
+        {
+            var dye = r.Dyes.Count == 0 ? "" : "  " + string.Join(" / ", r.Dyes.Select(d => d.Name));
+            var src = string.IsNullOrEmpty(r.Source) ? "" : "   获取：" + r.Source;
+            sb.AppendLine($"{r.Slot}：{r.Name}{dye}   [{(r.Owned > 0 ? "已持有 x" + r.Owned : "未持有")}]{src}");
+        }
+        return sb.ToString();
+    }
+
+    private static void CopyTextToClipboard(string text)
+    {
+        try { ImGui.SetClipboardText(text); } catch { }
+    }
+
+    private static void OpenFolder(string dir)
+    {
+        try
+        {
+            Directory.CreateDirectory(dir);
+            Process.Start(new ProcessStartInfo { FileName = dir, UseShellExecute = true });
+        }
+        catch { }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  内嵌 OCR 脚本（纯 ASCII，避免编码问题）
+    // ══════════════════════════════════════════════════════════
+
+    private const string ScriptVersion = "v3";
+
+    private void EnsureOcrScript()
+    {
+        var dir = WorkDir();
+        Directory.CreateDirectory(dir);
+
+        var ver = Path.Combine(dir, "version.txt");
+        var cur = File.Exists(ver) ? File.ReadAllText(ver).Trim() : "";
+        if (cur == ScriptVersion && File.Exists(ScriptPath("ocr.ps1")) && File.Exists(ScriptPath("clip.ps1")))
+            return;
+
+        // ASCII only -> write with BOM so PowerShell 5.1 parses it reliably
+        var enc = new UTF8Encoding(true);
+        File.WriteAllText(ScriptPath("ocr.ps1"), OcrScript, enc);
+        File.WriteAllText(ScriptPath("clip.ps1"), ClipScript, enc);
+        File.WriteAllText(ver, ScriptVersion, new UTF8Encoding(false));
+    }
+
+    private const string ClipScript = """
+$ErrorActionPreference = 'Stop'
+$out = $args[0]
+$log = Join-Path $env:TEMP 'LKami9GlamourHelper\last_error.txt'
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+  $img = [System.Windows.Forms.Clipboard]::GetImage()
+  if ($null -eq $img) { Write-Output 'NOIMAGE'; exit 2 }
+  $dir = Split-Path $out -Parent
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $img.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+  $img.Dispose()
+  Write-Output 'OK'
+  exit 0
+} catch {
+  [System.IO.File]::WriteAllText($log, ($_.Exception.ToString() + "`n" + $_.ScriptStackTrace), (New-Object System.Text.UTF8Encoding($false)))
+  Write-Output ('ERR ' + $_.Exception.Message)
+  exit 1
+}
+""";
+
+    private const string OcrScript = """
+$ErrorActionPreference = 'Stop'
+$img = $args[0]
+$out = $args[1]
+$log = Join-Path $env:TEMP 'LKami9GlamourHelper\last_error.txt'
+try {
+  if (-not $img) { Write-Output 'NOIMGARG'; exit 4 }
+  if (-not (Test-Path -LiteralPath $img)) { Write-Output ('NOFILE ' + $img); exit 5 }
+  if (-not $out) { Write-Output 'NOOUTARG'; exit 6 }
+
+  $types = @(
+    '[Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime]',
+    '[Windows.Media.Ocr.OcrResult, Windows.Media.Ocr, ContentType=WindowsRuntime]',
+    '[Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]',
+    '[Windows.Storage.FileAccessMode, Windows.Storage, ContentType=WindowsRuntime]',
+    '[Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]',
+    '[Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]',
+    '[Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType=WindowsRuntime]'
+  )
+  foreach ($t in $types) { try { Invoke-Expression $t | Out-Null } catch {} }
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+  $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+  if ($null -eq $asTask) { Write-Output 'NOASTASK'; exit 7 }
+
+  function Await($op, $t) {
+    if ($null -eq $op) { throw ('Async operation is null for type ' + $t) }
+    $m = $asTask.MakeGenericMethod($t)
+    $task = $m.Invoke($null, @($op))
+    $task.Wait(30000) | Out-Null
+    return $task.Result
+  }
+
+  $engine = $null
+  foreach ($l in [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages) {
+    if ($l.LanguageTag -like 'zh*') { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($l); break }
+  }
+  if (-not $engine) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }
+  if (-not $engine) { Write-Output 'NOLANG'; exit 3 }
+
+  $file    = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($img)) ([Windows.Storage.StorageFile])
+  $stream  = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+  $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+  $bitmap  = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+  $result  = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+
+  $lines = @()
+  foreach ($line in $result.Lines) {
+    $words = @()
+    $lx = [double]::MaxValue; $ly = [double]::MaxValue; $rx = 0.0; $by = 0.0
+    foreach ($w in $line.Words) {
+      $r = $w.BoundingRect
+      $words += [pscustomobject]@{
+        text = $w.Text
+        x = [math]::Round($r.X, 1); y = [math]::Round($r.Y, 1)
+        w = [math]::Round($r.Width, 1); h = [math]::Round($r.Height, 1) }
+      if ($r.X -lt $lx) { $lx = $r.X }
+      if ($r.Y -lt $ly) { $ly = $r.Y }
+      if (($r.X + $r.Width) -gt $rx) { $rx = $r.X + $r.Width }
+      if (($r.Y + $r.Height) -gt $by) { $by = $r.Y + $r.Height }
+    }
+    $lines += [pscustomobject]@{
+      text = $line.Text
+      x = [math]::Round($lx, 1); y = [math]::Round($ly, 1)
+      w = [math]::Round($rx - $lx, 1); h = [math]::Round($by - $ly, 1)
+      words = $words }
+  }
+  $payload = [pscustomobject]@{
+    image  = (Split-Path $img -Leaf)
+    width  = $decoder.PixelWidth
+    height = $decoder.PixelHeight
+    lang   = $engine.RecognizerLanguage.LanguageTag
+    lines  = $lines }
+  [System.IO.File]::WriteAllText($out, ($payload | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+  Write-Output ('OK ' + $lines.Count)
+  exit 0
+} catch {
+  [System.IO.File]::WriteAllText($log, ($_.Exception.ToString() + "`n--- script stack ---`n" + $_.ScriptStackTrace + "`n--- args ---`nimg=$img`nout=$out"), (New-Object System.Text.UTF8Encoding($false)))
+  Write-Output ('ERR ' + $_.Exception.Message)
+  exit 1
+}
+""";
+}
+
+/// <summary>一行识别结果</summary>
+public sealed class SlotResult
+{
+    public int Index { get; set; }
+    public string Slot { get; set; } = "";
+    public uint ItemId { get; set; }
+    public uint IconId { get; set; }
+    public string Name { get; set; } = "";
+    public int MatchScore { get; set; }
+
+    /// <summary>低于 100 分（模糊匹配）时置位 —— UI 上打问号提示玩家斧正。</summary>
+    public bool NeedsReview { get; set; }
+
+    public List<DyeResult> Dyes { get; set; } = [];
+    public int Owned { get; set; }
+
+    /// <summary>持有位置说明（背包/兵装库/装备栏/投影台/收藏柜…），用于提示框。</summary>
+    public string OwnedWhere { get; set; } = "";
+
+    /// <summary>不可交易（市场板买不到、只能自己搞）。</summary>
+    public bool Untradable { get; set; }
+
+    public string Source { get; set; } = "";
+}
+
+public sealed class DyeResult
+{
+    public DyeResult(string name, uint id, bool isEmpty, int score, double x = 0)
+    {
+        this.Name = name;
+        this.Id = id;
+        this.IsEmpty = isEmpty;
+        this.Score = score;
+        this.NeedsReview = score < 100 && !isEmpty;
+        this.X = x;
+    }
+
+    public string Name { get; set; }
+    public uint Id { get; set; }
+    public bool IsEmpty { get; }
+    public int Score { get; }
+
+    /// <summary>图上坐标（用于排「槽1 / 槽2」的顺序，即左右顺序）。</summary>
+    public double X { get; }
+
+    /// <summary>低于 100 分（模糊匹配）时置位 —— UI 上打问号。</summary>
+    public bool NeedsReview { get; }
+}
+
+/// <summary>没能识别成装备的文本片段（供玩家手动指派）</summary>
+/// <remarks>这些必须是**字段**而不是属性 —— ImGui.InputText 需要 ref 变量，属性不能传 ref。</remarks>
+public sealed class UnknownFragment
+{
+    public string Text = "";
+    public string EditBuffer = "";
+    public string Hint = "";
+}
+
+public sealed class LKami9GlamourHelperConfig
+{
+    public string LastImagePath { get; set; } = "";
+    public int OcrTimeoutMs { get; set; } = 30000;
+    public bool ShowSources { get; set; } = true;
+
+    /// <summary>把没识别上的片段也列出来供手动指派（默认开）。</summary>
+    public bool ShowUnknowns { get; set; } = true;
+
+    /// <summary>警示色（问号、模糊匹配提示、斧正面板标题都用它）。</summary>
+    public float[] WarnColor { get; set; } = [0.95f, 0.62f, 0.20f, 1f];
+
+    /// <summary>错误色（OCR 失败等）。</summary>
+    public float[] ErrorColor { get; set; } = [0.95f, 0.35f, 0.30f, 1f];
+
+    /// <summary>持有色（「有 xN」）。</summary>
+    public float[] OwnedColor { get; set; } = [0.40f, 0.90f, 0.40f, 1f];
+
+    /// <summary>未持有色（「无」）。</summary>
+    public float[] NotOwnedColor { get; set; } = [0.90f, 0.55f, 0.40f, 1f];
+}
