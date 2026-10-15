@@ -65,10 +65,19 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private string pathBuffer = "";
     private bool pathInit;
 
-    // ── 导入幻化管理 ──
+    // ── 本地试穿 / 导入幻化管理 ──
     private string presetName = "";
     private bool presetNameInit;
     private string presetStatus = "";
+
+    private OmniToolbox.Items.ItemPreviewService? previewService;   // 懒建：第一次试穿时才 new
+    private readonly List<(int Slot, uint ItemId, byte S0, byte S1)> tryOnItems = [];
+    private readonly HashSet<int> tryOnSkipped = [];   // 怎么都穿不上的（不是装备等）
+    private int tryOnLastIndex = -1;
+    private int tryOnRetry;          // 同一件连续失败几帧
+    private bool tryOnHeadDone;      // 眼镜/发型是否已处理
+    private bool tryOnActive;
+    private bool frameworkHooked;
 
     // ── 文字颜色：一律跟随 Omni 主题（不再单独配置）──
     //    取 OmniTheme.Tokens，切换主题/明暗时本模块会跟着变。
@@ -102,11 +111,33 @@ public sealed class LKami9GlamourHelper : ModuleBase
     {
         try { EnsureOcrScript(); }
         catch (Exception ex) { DalamudServices.PluginLog.Error(ex, "[幻化助手] 写出 OCR 脚本失败"); }
+
+        // 试穿要每帧推进（同帧多次调 Agent/模型接口会互相覆盖）
+        try
+        {
+            DalamudServices.Framework.Update += this.OnFrameworkTick;
+            this.frameworkHooked = true;
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 注册框架更新失败（试穿不可用）"); }
     }
 
-    protected override void OnDisable() { }
+    protected override void OnDisable()
+    {
+        try
+        {
+            if (this.frameworkHooked) DalamudServices.Framework.Update -= this.OnFrameworkTick;
+            this.frameworkHooked = false;
+        }
+        catch { }
 
-    protected override void OnDispose() { }
+        this.StopTryOn(clear: true);
+    }
+
+    protected override void OnDispose()
+    {
+        try { this.previewService?.Dispose(); } catch { }
+        this.previewService = null;
+    }
 
     public override bool ResetSettings()
     {
@@ -1914,33 +1945,38 @@ public sealed class LKami9GlamourHelper : ModuleBase
     }
 
     // ══════════════════════════════════════════════════════════
-    //  ④ 导入内置「更好的幻化管理」（**只读写配置文件，不碰宿主内存**）
-    //    落点：%APPDATA%\XIVLauncherCN\pluginConfigs\OmniToolbox\TreeHouse\
-    //            BetterGlamourManagement.json  →  { Enabled, Config: { Presets: [ … ] } }
+    //  ④ 本地试穿 / 导入内置「更好的幻化管理」
     //
-    //    槽位号 = 游戏幻化模板槽位号，已用道具名逐条核对（勿凭记忆改）：
-    //      0 主手  1 副手  2 头部  3 上衣  4 手部  5 腿部  6 脚部
-    //      7 耳坠  8 项链  9 手镯  10 戒指(右)  11 戒指(左)
-    //    核对依据：16986 血族剑→0 / 21011 圣母盾→1 / 16622 头花→2 / 50268 礼裙→3 /
-    //             32326 套袖→4 / 50264 短裙→5(腿) / 14976 礼鞋→6 / 9293 耳环→7 /
-    //             9292 项链→8 / 9294 手镯→9 / 9295 戒指→10、11
+    //    ★ 槽位号用的是**内置「Parts」/ 角色查看窗口的槽位号**，不是游戏幻化模板槽位号！
+    //      0 武器  1 副手  2 头部  3 身体  4 手部  5 (空)  6 腿部  7 脚部
+    //      8 耳饰  9 项链  10 手镯  11 右戒指  12 左戒指
+    //      证据（两条独立来源互相印证）：
+    //        ① 内置 BetterGlamourManagement.Parts：
+    //             Head=2 Body=3 Hands=4 Legs=6 Feet=7 Ears=8 Neck=9 Wrists=10 RingRight=11 RingLeft=12
+    //           InspectSlots = {0,1,2,3,4,6,7,8,9,10,11,12}（不含 5）
+    //        ② 玩家自己存的预设 + Item 表逐条核对：
+    //             16622 头花→2 / 50268 礼裙→3 / 32326 套袖→4 / 50264 短裙→6 / 14976 礼鞋→7
+    //             9293 耳环→8 / 9292 项链→9 / 9294 手镯→10 / 9295 戒指→11、12
+    //        两条完全吻合 → 以此为准。**之前按"游戏幻化模板槽位号"写是错的（腿以下整体差一格）**。
     //
-    //    ⚠ 这是宿主**启动时**读的文件 → 写完必须在 Dalamud 插件列表里把 OmniToolbox
-    //      禁用再启用（或重启游戏），新预设才会出现在内置界面里。
-    //    ⚠ 不去反射宿主的运行时对象（宿主把整份配置缓存在内存里，动它风险太大 —— 见交接文档）。
+    //    试穿走 OmniToolbox.Items.ItemPreviewService（OmniToolbox.Common 的公开类）：
+    //      自己 new 一个实例 + 每帧 Tick + PreviewEquipment(itemId, slot, stain0, stain1)
+    //      → 立刻在自己身上生效，不需要投影台、不需要持有装备、不需要重载插件。
+    //    导入内置列表 = 追加一条预设到 TreeHouse\BetterGlamourManagement.json（次要手段：
+    //      宿主只在启动时读这个文件，而且它保存时会把内存里的整份写回去 → 必须写完立刻重载）。
     // ══════════════════════════════════════════════════════════
 
     private static string OmniGlamourConfigPath() => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "XIVLauncherCN", "pluginConfigs", "OmniToolbox", "TreeHouse", "BetterGlamourManagement.json");
 
-    /// <summary>识别槽位名 → 预设槽位号（无对应槽位返回 -1，例如副手）。</summary>
+    /// <summary>识别槽位名 → 预设槽位号（0~12，见上面注释；无对应返回 -1，例如副手）。</summary>
     private static int OmniSlotOf(string slot) => slot switch
     {
         "主手" => 0,
-        "头部" => 2, "上衣" => 3, "手部" => 4, "腿部" => 5, "脚部" => 6,
-        "耳坠" => 7, "项链" => 8, "手镯" => 9,
-        "戒指" => 10,
+        "头部" => 2, "上衣" => 3, "手部" => 4, "腿部" => 6, "脚部" => 7,
+        "耳坠" => 8, "项链" => 9, "手镯" => 10,
+        "戒指" => 11,          // 第二枚戒指 → 12
         _ => -1,
     };
 
@@ -1954,36 +1990,51 @@ public sealed class LKami9GlamourHelper : ModuleBase
         return (s0, s1);
     }
 
-    /// <summary>识别结果 → 预设条目（同槽位去重；第二枚戒指落到 11 号槽）。</summary>
-    private List<Dictionary<string, object?>> BuildOmniItems(List<string> detail)
+    /// <summary>部位显示名（与内置「更好的幻化管理」自身的叫法一致）。</summary>
+    private static string SlotLabel(int slot) => slot switch
     {
-        var items = new List<Dictionary<string, object?>>();
+        0 => "武器", 2 => "头部", 3 => "身体", 4 => "手部", 6 => "腿部", 7 => "脚部",
+        8 => "耳饰", 9 => "项链", 10 => "手镯", 11 => "右戒指", 12 => "左戒指",
+        _ => "槽" + slot,
+    };
+
+    /// <summary>识别结果 → 槽位条目（同槽位去重；第二枚戒指落到 12 号槽）。</summary>
+    private List<(int Slot, uint ItemId, byte S0, byte S1)> BuildSlotItems()
+    {
+        var items = new List<(int Slot, uint ItemId, byte S0, byte S1)>();
         var placed = new HashSet<string>();
 
         foreach (var r in this.results)
         {
             var slot = OmniSlotOf(r.Slot);
-            if (slot < 0 || r.ItemId == 0) continue;
-            if (slot == 10) { if (!placed.Add("戒指")) continue; }   // 第二枚戒指留给下面
+            if (slot < 0 || r.ItemId == 0) continue;             // 副手不参与（内置按装备自判武器槽）
+            if (slot == 11) { if (!placed.Add("戒指")) continue; }   // 第二枚戒指留给下面
             else if (!placed.Add(r.Slot)) continue;
 
             var (s0, s1) = DyePair(r);
-            items.Add(new Dictionary<string, object?>
-            {
-                ["Slot"] = slot, ["ItemID"] = r.ItemId, ["Stain0"] = s0, ["Stain1"] = s1,
-            });
-            detail.Add($"{r.Slot}→{slot}");
+            items.Add((slot, r.ItemId, s0, s1));
         }
 
         var rings = this.results.Where(r => r.Slot == "戒指" && r.ItemId != 0).ToList();
         if (rings.Count > 1)
         {
             var (s0, s1) = DyePair(rings[1]);
+            items.Add((12, rings[1].ItemId, s0, s1));
+        }
+        return items;
+    }
+
+    /// <summary>识别结果 → 预设条目（JSON 形态）。</summary>
+    private List<Dictionary<string, object?>> BuildOmniItems(List<string> detail)
+    {
+        var items = new List<Dictionary<string, object?>>();
+        foreach (var (slot, itemId, s0, s1) in this.BuildSlotItems())
+        {
             items.Add(new Dictionary<string, object?>
             {
-                ["Slot"] = 11, ["ItemID"] = rings[1].ItemId, ["Stain0"] = s0, ["Stain1"] = s1,
+                ["Slot"] = slot, ["ItemID"] = itemId, ["Stain0"] = s0, ["Stain1"] = s1,
             });
-            detail.Add("戒指(第2枚)→11");
+            detail.Add($"{SlotLabel(slot)}→{slot}");
         }
         return items;
     }
@@ -2100,9 +2151,9 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private void DrawOmniPresetSection()
     {
         ImGui.Spacing();
-        ImGui.TextUnformatted("④ 导入幻化管理");
+        ImGui.TextUnformatted("④ 本地试穿 / 导入幻化管理");
         ImGui.SameLine();
-        ImGui.TextDisabled("（写进内置「更好的幻化管理」，可本地试穿；不需要投影台、不需要持有装备）");
+        ImGui.TextDisabled("（不需要投影台、不需要持有装备）");
 
         if (!this.presetNameInit)
         {
@@ -2113,14 +2164,16 @@ public sealed class LKami9GlamourHelper : ModuleBase
         var noResult = this.results.Count == 0;
         using (ImRaii.Disabled(noResult))
         {
-            ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
-            ImGui.InputText("预设名###omniPresetName", ref this.presetName, 64);
-
-            ImGui.SameLine();
-            if (ImGui.Button("导入幻化管理")) ImportToOmniGlamour();
+            if (ImGui.Button("试穿这套")) StartTryOnFromResults();
             if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("把识别到的装备 + 染剂追加成一条预设，写入内置「更好的幻化管理」的配置\n" +
-                                 "写完后需要把 OmniToolbox 重载一次它才会读到（会清空本模块当前识别结果）");
+                ImGui.SetTooltip("立刻穿到你自己身上看效果（只影响本地显示，别人看不到、也不改真实幻化）");
+        }
+
+        ImGui.SameLine();
+        using (ImRaii.Disabled(!this.tryOnActive))
+        {
+            if (ImGui.Button("取消试穿")) StopTryOn(clear: true);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("恢复试穿前的样子");
         }
 
         ImGui.SameLine();
@@ -2128,11 +2181,140 @@ public sealed class LKami9GlamourHelper : ModuleBase
             DalamudServices.CommandManager.ProcessCommand("/omni 幻化管理");
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("等价于在聊天框输入 /omni 幻化管理");
 
+        ImGui.Spacing();
+        ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("预设名###omniPresetName", ref this.presetName, 64);
+        ImGui.SameLine();
+        using (ImRaii.Disabled(noResult))
+        {
+            if (ImGui.Button("存进内置列表")) ImportToOmniGlamour();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("把识别结果追加成一条预设写进内置「更好的幻化管理」的配置文件\n" +
+                                 "⚠ 内置功能只在启动时读这个文件：写完要立刻把 OmniToolbox 禁用再启用，\n" +
+                                 "且在重载之前别在内置界面里点保存（它会拿内存里的旧列表覆盖掉）");
+        }
+
         if (noResult)
-            ImGui.TextDisabled("先识别一张图（② 识别结果里有内容），「导入幻化管理」才会可用。");
+            ImGui.TextDisabled("先识别一张图（② 识别结果里有内容），上面的按钮才会可用。");
 
         if (!string.IsNullOrEmpty(this.presetStatus))
             ImGui.TextWrapped(this.presetStatus);
+    }
+
+    // ── 本地试穿：用内置同款的 ItemPreviewService（公开 API）────────────────
+
+    /// <summary>把当前识别结果排进试穿队列（逐帧补，参见 OnFrameworkTick）。</summary>
+    private void StartTryOnFromResults()
+    {
+        var items = this.BuildSlotItems();
+        if (items.Count == 0)
+        {
+            this.presetStatus = "没有可试穿的部位（副手不参与试穿）。";
+            return;
+        }
+
+        try
+        {
+            this.previewService ??= new OmniToolbox.Items.ItemPreviewService();
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 创建试穿服务失败");
+            this.presetStatus = "试穿服务不可用（看 /xllog）。";
+            return;
+        }
+
+        this.tryOnItems.Clear();
+        this.tryOnItems.AddRange(items);
+        this.tryOnSkipped.Clear();
+        this.tryOnLastIndex = -1;
+        this.tryOnRetry = 0;
+        this.tryOnHeadDone = false;
+        this.tryOnActive = true;
+        this.presetStatus = $"正在试穿 {items.Count} 件…";
+    }
+
+    /// <summary>停止试穿并恢复原样。</summary>
+    private void StopTryOn(bool clear)
+    {
+        var wasActive = this.tryOnActive;
+        this.tryOnActive = false;
+        this.tryOnItems.Clear();
+        this.tryOnSkipped.Clear();
+        this.tryOnLastIndex = -1;
+        this.tryOnRetry = 0;
+        this.tryOnHeadDone = false;
+        if (!clear) return;
+
+        try
+        {
+            this.previewService?.ClearPreviewResidue();
+            if (wasActive) this.presetStatus = "已取消试穿。";
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 取消试穿失败"); }
+    }
+
+    /// <summary>
+    /// 每帧推进试穿：每帧只处理一件（同帧多次调模型接口会互相覆盖）。
+    /// 采用「找第一件还没生效的」写法 —— 游戏每帧会重置模型、换装备/切地图也会清掉，
+    /// 这样能自动补回来（和内置的行为一致），直到玩家点「取消试穿」。
+    /// </summary>
+    private void OnFrameworkTick(Dalamud.Plugin.Services.IFramework framework)
+    {
+        var svc = this.previewService;
+        if (svc == null) return;
+
+        try
+        {
+            svc.Tick(framework);            // 内置同款：切地图/换人时自动清残留
+            if (!this.tryOnActive || this.tryOnItems.Count == 0) return;
+
+            // ① 装备：找第一件「还没生效」的补上
+            var idx = -1;
+            for (var i = 0; i < this.tryOnItems.Count; i++)
+            {
+                if (this.tryOnSkipped.Contains(i)) continue;
+                var t = this.tryOnItems[i];
+                if (svc.IsEquipmentPreviewApplied(t.ItemId, t.Slot, t.S0, t.S1)) continue;
+                idx = i;
+                break;
+            }
+
+            if (idx >= 0)
+            {
+                var it = this.tryOnItems[idx];
+                var ok = svc.PreviewEquipment(it.ItemId, it.Slot, it.S0, it.S1);
+
+                if (this.tryOnLastIndex == idx) this.tryOnRetry++;
+                else { this.tryOnLastIndex = idx; this.tryOnRetry = 0; }
+
+                if (!ok || this.tryOnRetry >= 6)
+                {
+                    DalamudServices.PluginLog.Information(
+                        $"[幻化助手] 试穿跳过 道具 {it.ItemId}（槽位 {it.Slot}，ok={ok}）");
+                    this.tryOnSkipped.Add(idx);
+                    this.tryOnRetry = 0;
+                }
+                return;
+            }
+
+            // ② 全部生效 → 眼镜/发型
+            if (!this.tryOnHeadDone)
+            {
+                svc.PreviewGlasses(0);              // 识别结果里没有眼镜信息 → 先不戴
+                svc.RestoreHairstylePreview();      // 发型也不动
+                this.tryOnHeadDone = true;
+
+                var n = this.tryOnItems.Count - this.tryOnSkipped.Count;
+                this.presetStatus = $"试穿中（{n} 件）。只改本地显示；点「取消试穿」可还原。";
+                DalamudServices.PluginLog.Information($"[幻化助手] 试穿已应用：{n} 件");
+            }
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 试穿推进异常，已停止");
+            this.StopTryOn(clear: false);
+        }
     }
 
     // ══════════════════════════════════════════════════════════
