@@ -101,7 +101,10 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
     private static readonly string[] SpecialLex = ["不可染色", "无染色"];
     private static readonly string[] SlotOrder =
-        ["主手", "副手", "头部", "上衣", "手部", "腿部", "脚部", "耳坠", "项链", "手镯", "戒指"];
+    [
+        "主手", "副手", "头部", "上衣", "手部", "腿部", "脚部", "耳坠", "项链", "手镯", "戒指",
+        "面部配饰", "时尚配饰",
+    ];
 
     // ══════════════════════════════════════════════════════════
     //  生命周期
@@ -286,6 +289,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         // 固定列出 14 个部位（石之家那 14 个，顺序也一样）：识别到的填进去，没识别到的空着
         //   —— 这样一眼就能看出「缺哪一件」，而不是认不出就整行消失
         var used = new HashSet<int>();
+        this.fillSeq = 0;
         var ringRows = this.results.Where(x => x.Slot == "戒指").ToList();
         var ringDrawn = 0;
         foreach (var slot in ResultSlots)
@@ -312,6 +316,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.EndTable();
 
         DrawEditorPanel(warn);
+        DrawFillPanel();
         DrawUnknownSection(warn);
     }
 
@@ -335,12 +340,23 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
         if (r == null)
         {
-            // 没认到这个部位：后面几列全部画「—」，只留空位
-            for (var c = 0; c < 5; c++)
+            // 没认到这个部位：装备/染剂/获取/持有 画「—」，最后一列给个「填」按钮
+            for (var c = 0; c < 4; c++)
             {
                 ImGui.TableNextColumn();
                 ImGui.TextDisabled("—");
             }
+
+            ImGui.TableNextColumn();
+            var seq = this.fillSeq++;
+            if (ImGui.SmallButton($"填###fill{seq}"))
+            {
+                this.fillSlot = slot;
+                this.fillName = "";
+                this.fillHint = "";
+                this.fillCandidates.Clear();
+            }
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip($"手动给「{slot}」这一格填一件装备\n（查游戏道具表，自动补图标/持有/获取方式）");
             return;
         }
 
@@ -472,6 +488,91 @@ public sealed class LKami9GlamourHelper : ModuleBase
             if (this.editingIndex == idx) PrepareEditor(r);
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("修改这一行（粘贴正确的装备/染剂名）");
+    }
+
+    // ── 空行「填」面板（给没认到的部位手动配一件）──
+    private string? fillSlot;
+    private string fillName = "";
+    private string fillHint = "";
+    private int fillSeq;
+    private readonly List<string> fillCandidates = [];
+
+    private void DrawFillPanel()
+    {
+        if (this.fillSlot == null) return;
+        var slot = this.fillSlot;
+
+        ImGui.Separator();
+        ImGui.TextColored(this.WarnVec, $"填 「{slot}」");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("关闭")) { this.fillSlot = null; return; }
+
+        ImGui.TextDisabled("输入/粘贴装备名 → 查游戏道具表 → 填进这个部位（图标/持有/获取方式会自动补上）");
+
+        ImGui.SetNextItemWidth(320 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("装备名###fillName", ref this.fillName, 128);
+        ImGui.SameLine();
+        if (ImGui.Button("确认填充")) ApplyFill(slot);
+
+        if (this.fillCandidates.Count > 0)
+        {
+            ImGui.TextDisabled("候选（点击选用）：");
+            for (var i = 0; i < this.fillCandidates.Count; i++)
+            {
+                if (!ImGui.SmallButton($"{this.fillCandidates[i]}###fillCand{i}")) continue;
+                this.fillName = this.fillCandidates[i];
+                ApplyFill(slot);
+                break;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(this.fillHint))
+            ImGui.TextWrapped(this.fillHint);
+    }
+
+    private void ApplyFill(string slot)
+    {
+        if (string.IsNullOrWhiteSpace(this.fillName)) { this.fillHint = "请输入装备名。"; return; }
+
+        var cands = new List<string>();
+        var res = ResolveItem(this.fillName, cands);
+        if (res == null)
+        {
+            this.fillHint = $"没找到「{this.fillName}」对应的装备 —— 检查名称，或换个写法。";
+            this.fillCandidates.Clear();
+            return;
+        }
+
+        var item = res.Value;
+        if (this.results.Any(x => x.Slot == slot && slot != "戒指"))
+        {
+            this.fillHint = $"「{slot}」已经有装备了 —— 点那一行行尾的「改」去修改它。";
+            return;
+        }
+
+        var r = new SlotResult
+        {
+            Index = this.results.Count,
+            Slot = slot,                       // 用玩家点的那一格（不是数据表派生的槽位）
+            ItemId = item.Id,
+            IconId = item.Icon,
+            Name = item.Name,
+            MatchScore = 100,
+            NeedsReview = false,
+            Owned = CountOwned(item.Id, out var whereNow),
+            OwnedWhere = whereNow,
+        };
+        this.results.Add(r);
+
+        this.fillCandidates.Clear();
+        this.fillCandidates.AddRange(cands);
+        this.fillName = item.Name;
+
+        var mismatch = !string.Equals(item.Slot, slot, StringComparison.Ordinal);
+        this.fillHint = mismatch
+            ? $"已填进「{slot}」（注意：游戏数据里它属于「{item.Slot}」）"
+            : (cands.Count > 0 ? "已填入最接近的一项（若不是你要的，点候选换一个）" : "已填入");
+        SortResults();
     }
 
     // ── 修改面板（一次编辑一行）──
