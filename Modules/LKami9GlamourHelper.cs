@@ -239,6 +239,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
             ImGui.SetTooltip("OCR 认错字导致匹配不上时，把那些片段列出来，\n你可以粘贴正确名称把它补进结果表。");
     }
 
+    /// <summary>石之家幻化的 14 个部位（顺序与石之家一致，叫法与游戏内一致）。戒指占两行。</summary>
+    private static readonly string[] ResultSlots =
+    [
+        "主手", "副手", "头部", "上衣", "手部", "腿部", "脚部", "耳坠", "项链", "手镯",
+        "戒指", "戒指", "面部配饰", "时尚配饰",
+    ];
+
     private void DrawResultSection()
     {
         if (this.results.Count == 0)
@@ -248,10 +255,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
 
         var warn = this.WarnVec;
-        ImGui.TextUnformatted($"② 识别结果（{this.results.Count} 件）");
+        var filled = this.results.Select(r => r.Slot).Distinct().Count();
+        ImGui.TextUnformatted($"② 识别结果（{this.results.Count} 件 / 14 个部位里认到 {filled} 个）");
         ImGui.SameLine();
         if (ImGui.SmallButton("复制清单"))
             CopyTextToClipboard(BuildClipboardText());
+        ImGui.SameLine();
+        ImGui.TextDisabled("（14 个部位固定列出，没认到的空着 —— 点行尾「改」可手动填）");
 
         var needFix = this.results.Count(r => r.NeedsReview) + this.results.Sum(r => r.Dyes.Count(d => d.NeedsReview));
         if (needFix > 0)
@@ -273,148 +283,195 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 26 * ImGuiHelpers.GlobalScale);
         ImGui.TableHeadersRow();
 
-        for (var i = 0; i < this.results.Count; i++)
+        // 固定列出 14 个部位（石之家那 14 个，顺序也一样）：识别到的填进去，没识别到的空着
+        //   —— 这样一眼就能看出「缺哪一件」，而不是认不出就整行消失
+        var used = new HashSet<int>();
+        var ringRows = this.results.Where(x => x.Slot == "戒指").ToList();
+        var ringDrawn = 0;
+        foreach (var slot in ResultSlots)
         {
-            var r = this.results[i];
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted(r.Slot);
-
-            ImGui.TableNextColumn();
-            DrawGameIcon(r.IconId, 26f);
-
-            // 装备名（模糊匹配打问号）
-            ImGui.TableNextColumn();
-            if (r.NeedsReview) ImGui.TextColored(warn, "?");
-            else ImGui.TextDisabled("　");
-            ImGui.SameLine();
-            ImGui.TextUnformatted(r.Name);
-            if (r.NeedsReview && ImGui.IsItemHovered())
-                ImGui.SetTooltip($"OCR 识别不确定（匹配分 {r.MatchScore}）\n点行尾「改」粘贴正确名称即可修改");
-            if (r.MatchScore is < 100 and > 0)
+            var idx = -1;
+            if (slot == "戒指")
             {
-                ImGui.SameLine();
-                ImGui.TextDisabled($"({r.MatchScore})");
-            }
-
-            // 染剂（逐个标问号）
-            ImGui.TableNextColumn();
-            if (r.Dyes.Count == 0)
-            {
-                ImGui.TextDisabled("—");
+                if (ringDrawn < ringRows.Count) idx = this.results.IndexOf(ringRows[ringDrawn]);
+                ringDrawn++;
             }
             else
             {
-                for (var k = 0; k < r.Dyes.Count; k++)
-                {
-                    if (k > 0) { ImGui.SameLine(); ImGui.TextUnformatted(" /"); ImGui.SameLine(); }
-                    var d = r.Dyes[k];
-                    if (d.NeedsReview) { ImGui.TextColored(warn, "?"); ImGui.SameLine(); }
-
-                    // 染剂持有：✓xN（够染）/ ✗缺（没有这瓶染剂）
-                    var own = d.IsEmpty ? (0, "") : DyeOwned(d.Id);
-                    ImGui.TextUnformatted(d.Name);
-                    if (!d.IsEmpty)
-                    {
-                        ImGui.SameLine();
-                        if (own.Item1 > 0)
-                            ImGui.TextDisabled($"有 {own.Item1}");
-                        else
-                            ImGui.TextColored(this.NotOwnedVec, "缺");
-
-                        if (ImGui.IsItemHovered())
-                            ImGui.SetTooltip(this.BuildDyeTooltip(d, own));
-                    }
-                    else if (d.NeedsReview && ImGui.IsItemHovered())
-                    {
-                        ImGui.SetTooltip($"染剂识别不确定（匹配分 {d.Score}）\n点行尾「改」可改染剂名");
-                    }
-                }
+                idx = this.results.FindIndex(x => x.Slot == slot);
             }
 
-            // 获取方式
-            //   已持有 → 「已拥有」
-            //   未持有 → 获取方式 + 是否可交易（不可交易 = 只能自己搞；可交易 = 市场板还能买）
-            ImGui.TableNextColumn();
-            var srcs = GetSources(r.ItemId);                 // 已按优先级排好，不含版本号
-            var isCash = this.cashShopItems.Contains(r.ItemId);
-            var trade = r.Untradable ? "不可交易" : "可交易";
-            var hasStore = this.storeUrls.TryGetValue(r.ItemId, out var storeUrl);
-
-            if (r.Owned > 0)
-            {
-                ImGui.TextUnformatted("已拥有");
-            }
-            else
-            {
-                var main = isCash ? "商城购买" : (srcs.Count > 0 ? srcs[0] : "来源未知");
-                ImGui.TextUnformatted(main);
-                ImGui.SameLine();
-                ImGui.TextDisabled("· " + trade);
-            }
-
-            // 悬停：完整信息
-            if (ImGui.IsItemHovered())
-            {
-                var tip = new System.Text.StringBuilder();
-                if (r.Owned > 0)
-                {
-                    tip.AppendLine("已持有：" + (string.IsNullOrEmpty(r.OwnedWhere) ? $"x{r.Owned}" : r.OwnedWhere));
-                    tip.AppendLine();
-                }
-                tip.AppendLine(isCash ? "获取方式：商城购买" : "获取方式：");
-                if (srcs.Count > 0)
-                {
-                    foreach (var s in srcs.Take(5)) tip.AppendLine("  · " + s);
-                    if (srcs.Count > 5) tip.AppendLine($"  …还有 {srcs.Count - 5} 条");
-                    var det = GetSourceDetails(r.ItemId);
-                    if (det.Count > 0)
-                    {
-                        tip.AppendLine("  详情：");
-                        foreach (var d in det.Take(5)) tip.AppendLine("      " + d);
-                    }
-                }
-                else if (!isCash)
-                    tip.AppendLine("  · 来源未知");
-                tip.AppendLine();
-                tip.AppendLine("获取方式数据：最终幻想XIV中文维基（灰机wiki） CC BY-NC-SA 3.0");
-
-                tip.AppendLine();
-                tip.AppendLine("交易：" + trade);
-                if (this.patchInfo.TryGetValue(r.ItemId, out var patch)) tip.AppendLine(patch);
-                if (hasStore) tip.AppendLine("\n商城商品页（右键此格复制链接）：\n" + storeUrl);
-                ImGui.SetTooltip(tip.ToString().TrimEnd());
-            }
-
-            // 商城道具：右键复制商品页链接
-            if (hasStore && ImGui.IsItemClicked(ImGuiMouseButton.Right))
-            {
-                ImGui.SetClipboardText(storeUrl);
-                this.statusIsError = false;
-                this.status = "已复制商城商品页链接：" + storeUrl;
-            }
-
-            ImGui.TableNextColumn();
-            if (r.Owned > 0)
-                ImGui.TextColored(this.OwnedVec, $"有 x{r.Owned}");
-            else
-                ImGui.TextColored(this.NotOwnedVec, "无");
-            if (r.Owned > 0 && ImGui.IsItemHovered())
-                ImGui.SetTooltip(string.IsNullOrEmpty(r.OwnedWhere) ? "已持有" : "持有位置：" + r.OwnedWhere);
-
-            ImGui.TableNextColumn();
-            if (ImGui.SmallButton($"改###fix{i}"))
-            {
-                this.editingIndex = this.editingIndex == i ? -1 : i;
-                if (this.editingIndex == i) PrepareEditor(r);
-            }
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("修改这一行（粘贴正确的装备/染剂名）");
+            if (idx >= 0) used.Add(idx);
+            this.DrawResultRow(slot, idx, warn);
         }
+
+        // 兜底：槽位不在这 14 个里的（理论上不会出现）也照样画出来
+        for (var i = 0; i < this.results.Count; i++)
+            if (!used.Contains(i)) this.DrawResultRow(this.results[i].Slot, i, warn);
 
         ImGui.EndTable();
 
         DrawEditorPanel(warn);
         DrawUnknownSection(warn);
+    }
+
+    /// <summary>
+    /// 画一行识别结果。<paramref name="idx"/> = -1 表示这个部位没认到 → 整行画成空的（灰的「—」）。
+    /// </summary>
+    private void DrawResultRow(string slot, int idx, System.Numerics.Vector4 warn)
+    {
+        var r = idx >= 0 && idx < this.results.Count ? this.results[idx] : null;
+
+        ImGui.TableNextRow();
+
+        // 槽位
+        ImGui.TableNextColumn();
+        if (r == null) ImGui.TextDisabled(slot);
+        else ImGui.TextUnformatted(slot);
+
+        // 图标
+        ImGui.TableNextColumn();
+        if (r != null) DrawGameIcon(r.IconId, 26f);
+
+        if (r == null)
+        {
+            // 没认到这个部位：后面几列全部画「—」，只留空位
+            for (var c = 0; c < 5; c++)
+            {
+                ImGui.TableNextColumn();
+                ImGui.TextDisabled("—");
+            }
+            return;
+        }
+
+        // 装备名（模糊匹配打问号）
+        ImGui.TableNextColumn();
+        if (r.NeedsReview) ImGui.TextColored(warn, "?");
+        else ImGui.TextDisabled("　");
+        ImGui.SameLine();
+        ImGui.TextUnformatted(r.Name);
+        if (r.NeedsReview && ImGui.IsItemHovered())
+            ImGui.SetTooltip($"OCR 识别不确定（匹配分 {r.MatchScore}）\n点行尾「改」粘贴正确名称即可修改");
+        if (r.MatchScore is < 100 and > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"({r.MatchScore})");
+        }
+
+        // 染剂（逐个标问号）
+        ImGui.TableNextColumn();
+        if (r.Dyes.Count == 0)
+        {
+            ImGui.TextDisabled("—");
+        }
+        else
+        {
+            for (var k = 0; k < r.Dyes.Count; k++)
+            {
+                if (k > 0) { ImGui.SameLine(); ImGui.TextUnformatted(" /"); ImGui.SameLine(); }
+                var d = r.Dyes[k];
+                if (d.NeedsReview) { ImGui.TextColored(warn, "?"); ImGui.SameLine(); }
+
+                // 染剂持有：有 xN / 缺
+                var own = d.IsEmpty ? (0, "") : DyeOwned(d.Id);
+                ImGui.TextUnformatted(d.Name);
+                if (!d.IsEmpty)
+                {
+                    ImGui.SameLine();
+                    if (own.Item1 > 0)
+                        ImGui.TextDisabled($"有 {own.Item1}");
+                    else
+                        ImGui.TextColored(this.NotOwnedVec, "缺");
+
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(this.BuildDyeTooltip(d, own));
+                }
+                else if (d.NeedsReview && ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip($"染剂识别不确定（匹配分 {d.Score}）\n点行尾「改」可改染剂名");
+                }
+            }
+        }
+
+        // 获取方式
+        //   已持有 → 「已拥有」
+        //   未持有 → 获取方式 + 是否可交易（不可交易 = 只能自己搞；可交易 = 市场板还能买）
+        ImGui.TableNextColumn();
+        var srcs = GetSources(r.ItemId);                 // 已按优先级排好，不含版本号
+        var isCash = this.cashShopItems.Contains(r.ItemId);
+        var trade = r.Untradable ? "不可交易" : "可交易";
+        var hasStore = this.storeUrls.TryGetValue(r.ItemId, out var storeUrl);
+
+        if (r.Owned > 0)
+        {
+            ImGui.TextUnformatted("已拥有");
+        }
+        else
+        {
+            var main = isCash ? "商城购买" : (srcs.Count > 0 ? srcs[0] : "来源未知");
+            ImGui.TextUnformatted(main);
+            ImGui.SameLine();
+            ImGui.TextDisabled("· " + trade);
+        }
+
+        // 悬停：完整信息
+        if (ImGui.IsItemHovered())
+        {
+            var tip = new System.Text.StringBuilder();
+            if (r.Owned > 0)
+            {
+                tip.AppendLine("已持有：" + (string.IsNullOrEmpty(r.OwnedWhere) ? $"x{r.Owned}" : r.OwnedWhere));
+                tip.AppendLine();
+            }
+            tip.AppendLine(isCash ? "获取方式：商城购买" : "获取方式：");
+            if (srcs.Count > 0)
+            {
+                foreach (var s in srcs.Take(5)) tip.AppendLine("  · " + s);
+                if (srcs.Count > 5) tip.AppendLine($"  …还有 {srcs.Count - 5} 条");
+                var det = GetSourceDetails(r.ItemId);
+                if (det.Count > 0)
+                {
+                    tip.AppendLine("  详情：");
+                    foreach (var d in det.Take(5)) tip.AppendLine("      " + d);
+                }
+            }
+            else if (!isCash)
+                tip.AppendLine("  · 来源未知");
+            tip.AppendLine();
+            tip.AppendLine("获取方式数据：最终幻想XIV中文维基（灰机wiki） CC BY-NC-SA 3.0");
+
+            tip.AppendLine();
+            tip.AppendLine("交易：" + trade);
+            if (this.patchInfo.TryGetValue(r.ItemId, out var patch)) tip.AppendLine(patch);
+            if (hasStore) tip.AppendLine("\n商城商品页（右键此格复制链接）：\n" + storeUrl);
+            ImGui.SetTooltip(tip.ToString().TrimEnd());
+        }
+
+        // 商城道具：右键复制商品页链接
+        if (hasStore && ImGui.IsItemClicked(ImGuiMouseButton.Right))
+        {
+            ImGui.SetClipboardText(storeUrl);
+            this.statusIsError = false;
+            this.status = "已复制商城商品页链接：" + storeUrl;
+        }
+
+        // 持有
+        ImGui.TableNextColumn();
+        if (r.Owned > 0)
+            ImGui.TextColored(this.OwnedVec, $"有 x{r.Owned}");
+        else
+            ImGui.TextColored(this.NotOwnedVec, "无");
+        if (r.Owned > 0 && ImGui.IsItemHovered())
+            ImGui.SetTooltip(string.IsNullOrEmpty(r.OwnedWhere) ? "已持有" : "持有位置：" + r.OwnedWhere);
+
+        // 修改
+        ImGui.TableNextColumn();
+        if (ImGui.SmallButton($"改###fix{idx}"))
+        {
+            this.editingIndex = this.editingIndex == idx ? -1 : idx;
+            if (this.editingIndex == idx) PrepareEditor(r);
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("修改这一行（粘贴正确的装备/染剂名）");
     }
 
     // ── 修改面板（一次编辑一行）──
@@ -2471,13 +2528,23 @@ public sealed class LKami9GlamourHelper : ModuleBase
         return s;
     }
 
-    /// <summary>明显不是装备名的碎片（部位标签、染色说明、纯数字）—— 不往「未识别文本」里塞。</summary>
+    /// <summary>石之家/游戏界面上的按钮、标签文字 —— 不是装备名，别往「未识别文本」里塞。</summary>
+    private static readonly string[] UiNoiseLex =
+    [
+        "生成图片", "保存图片", "查看大图", "分享", "复制链接", "复制", "编辑", "删除", "返回",
+        "更多", "收起", "展开", "染色", "染剂", "幻化", "投影", "装备", "部位", "外观", "套装",
+        "全部", "筛选", "搜索", "登录", "评论", "点赞", "收藏", "投稿", "浏览",
+    ];
+
+    /// <summary>明显不是装备名的碎片（部位标签、界面按钮、染色说明、纯数字）—— 不往「未识别文本」里塞。</summary>
     private static bool IsNoiseFragment(string s)
     {
         if (IsSlotLabel(s)) return true;
         foreach (var w in SpecialLex)
             if (s.Contains(w)) return true;
         if (s.Contains("染色") || s.Contains("染剂") || s.Contains("颜色")) return true;
+        foreach (var w in UiNoiseLex)
+            if (s == w) return true;
         if (s.All(c => !char.IsLetter(c))) return true;
         return false;
     }

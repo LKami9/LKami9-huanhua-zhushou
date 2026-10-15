@@ -6,10 +6,10 @@
       "Name": "LKami9幻化助手",
       "Author": "LKami9",
       "Description": "从石之家幻化截图（剪贴板或图片文件）识别 14 个部位（含面部配饰/时尚配饰）的装备与染剂；显示持有情况、获取方式（最终幻想XIV中文维基）与可交易性；支持手动修改；可写入游戏内幻化模板（含自动染色）并应用；可本地试穿（不需要投影台、不需要持有装备）。",
-      "Version": "1.14.0",
+      "Version": "1.15.0",
       "MinimumOmniVersion": "1.1.7.0",
       "File": "Modules/LKami9GlamourHelper.cs",
-      "Sha256": "0F4B17AB90B56BD37C6AB6DFE32C5E0CBEA94C01C98C9D51DE6AD3CB56316D30"
+      "Sha256": "AB4167330C59FDE9AB7752435C5CD75BCFD5B1B13A1C4E54F3DB49F464AE66FA"
     }
   ]
 }
