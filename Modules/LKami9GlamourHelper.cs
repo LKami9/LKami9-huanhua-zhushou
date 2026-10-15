@@ -38,7 +38,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     public override ModuleInfo Info { get; } = new()
     {
         Title       = "LKami9幻化助手",
-        Description = "粘贴石之家幻化截图（剪贴板或文件），识别出装备与染剂，并显示是否持有、获取方式。支持网页整图 / 网页局部 / 分享图预设 / 手机截图。",
+        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别装备与染剂，显示是否持有、获取方式与可交易性；支持手动斧正；把识别结果写入游戏幻化模板（含自动染色）并应用；可本地试穿（不需要投影台、不需要持有装备）；也可存进内置「更好的幻化管理」的预设列表。",
         Category    = ModuleCategory.Item,
         Author      = "LKami9",
         Commands    = [new("用上次的图重新识别", "/omni LKami9GlamourHelper scan")],
@@ -70,6 +70,10 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private string presetName = "";
     private bool presetNameInit;
     private string presetStatus = "";
+
+    /// <summary>等着写进内置列表的预设（先让内置把窗口开起来，下一帧再注入 —— 见 TickPendingBuiltinImport）。</summary>
+    private (string Name, List<(int Slot, uint ItemId, byte S0, byte S1)> Items)? pendingBuiltinImport;
+    private int pendingImportFrames;
 
     private OmniToolbox.Items.ItemPreviewService? previewService;   // 懒建：第一次试穿时才 new
     private readonly List<(int Slot, uint ItemId, byte S0, byte S1)> tryOnItems = [];
@@ -2026,10 +2030,11 @@ public sealed class LKami9GlamourHelper : ModuleBase
     }
 
     /// <summary>识别结果 → 预设条目（JSON 形态）。</summary>
-    private List<Dictionary<string, object?>> BuildOmniItems(List<string> detail)
+    private static List<Dictionary<string, object?>> ToJsonItems(
+        List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems, List<string> detail)
     {
         var items = new List<Dictionary<string, object?>>();
-        foreach (var (slot, itemId, s0, s1) in this.BuildSlotItems())
+        foreach (var (slot, itemId, s0, s1) in slotItems)
         {
             items.Add(new Dictionary<string, object?>
             {
@@ -2155,31 +2160,86 @@ public sealed class LKami9GlamourHelper : ModuleBase
             return;
         }
 
+        if (this.pendingBuiltinImport != null)
+        {
+            this.presetStatus = "上一条还在写入内置列表，稍等一下再点。";
+            return;
+        }
+
         var detail = new List<string>();
         foreach (var (slot, _, _, _) in slotItems) detail.Add($"{SlotLabel(slot)}→{slot}");
         var detailText = string.Join("、", detail);
 
-        // ① 首选：塞进内置模块的活配置（立刻可见 + 让宿主自己落盘）
+        // ① 内置管理界面已经开着 → 直接塞进它的活配置，立刻可见
         try
         {
             if (this.TryAddToLiveBuiltin(name, slotItems, out var liveHow))
             {
-                this.presetStatus =
-                    $"已存进内置「更好的幻化管理」：{name} / {slotItems.Count} 件（{detailText}）。" +
-                    $"来源：{liveHow}。\n点右边「打开幻化管理」就能看到；也可以直接点「试穿这套」本地试穿。";
-                DalamudServices.PluginLog.Information(
-                    $"[幻化助手] 已存进内置幻化管理：{name} / {slotItems.Count} 件 / 映射 {detailText} / {liveHow}");
+                SetBuiltinOkStatus(name, slotItems, liveHow);
                 return;
             }
         }
         catch (Exception ex)
         {
-            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写内置内存失败，转写配置文件");
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写内置内存失败（稍后会重试）");
         }
 
-        // ② 兜底：写配置文件（宿主只在启动时读 → 需要重载）
+        // ② 界面还没开过 → 让内置自己把窗口开起来（游戏创建原生窗口时会把它登记进 CreatedAddons），
+        //    然后由 TickPendingBuiltinImport 在接下来几帧里重试注入
+        this.pendingBuiltinImport = (name, slotItems);
+        this.pendingImportFrames = 0;
+        try { DalamudServices.CommandManager.ProcessCommand("/omni 幻化管理"); }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 发送打开命令失败"); }
+        this.presetStatus = "正在打开内置「更好的幻化管理」并把预设写进去…";
+    }
+
+    /// <summary>每帧检查有没有等着注入的预设（等内置窗口创建完成后再注入）。</summary>
+    private void TickPendingBuiltinImport()
+    {
+        if (this.pendingBuiltinImport is not { } pending) return;
+
+        this.pendingImportFrames++;
+        if (this.pendingImportFrames < 3) return;          // 给游戏两帧去创建原生窗口
+
+        try
+        {
+            if (this.TryAddToLiveBuiltin(pending.Name, pending.Items, out var how))
+            {
+                this.pendingBuiltinImport = null;
+                SetBuiltinOkStatus(pending.Name, pending.Items, how);
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 注入内置配置失败（继续重试）");
+        }
+
+        if (this.pendingImportFrames >= 150)                // ≈2.5 秒还不行 → 退回写文件
+        {
+            this.pendingBuiltinImport = null;
+            DalamudServices.PluginLog.Information("[幻化助手] 拿不到内置模块活实例，退回写配置文件");
+            this.TryWritePresetFile(pending.Name, pending.Items);
+        }
+    }
+
+    private void SetBuiltinOkStatus(string name, List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems, string how)
+    {
+        var labels = new List<string>();
+        foreach (var (slot, _, _, _) in slotItems) labels.Add($"{SlotLabel(slot)}→{slot}");
+
+        this.presetStatus =
+            $"已存进内置「更好的幻化管理」：{name} / {slotItems.Count} 件（{string.Join("、", labels)}）。" +
+            $"来源：{how}。\n直接点「打开幻化管理」就能看到并试穿。";
+        DalamudServices.PluginLog.Information(
+            $"[幻化助手] 已存进内置幻化管理：{name} / {slotItems.Count} 件 / 映射 {string.Join("、", labels)} / {how}");
+    }
+
+    /// <summary>兜底：把预设写进内置的配置文件（宿主只在启动时读 → 需要重载 OmniToolbox 才会出现）。</summary>
+    private void TryWritePresetFile(string name, List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems)
+    {
         var detail2 = new List<string>();
-        var items = BuildOmniItems(detail2);
+        var items = ToJsonItems(slotItems, detail2);
         var path = OmniGlamourConfigPath();
         try
         {
@@ -2309,9 +2369,9 @@ public sealed class LKami9GlamourHelper : ModuleBase
         {
             if (ImGui.Button("存进内置列表")) ImportToOmniGlamour();
             if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("把识别结果追加成一条预设，存进内置「更好的幻化管理」的预设列表\n" +
-                                 "存完点「打开幻化管理」即可看到并试穿\n" +
-                                 "（直接写进内置模块正在用的配置，不需要重载插件）");
+                ImGui.SetTooltip("把识别结果追加成一条预设，直接存进内置「更好的幻化管理」正在用的配置\n" +
+                                 "如果内置界面还没开过，会自动帮你打开它 —— 打开后就能看到并试穿\n" +
+                                 "（不需要重载插件）");
         }
 
         if (noResult)
@@ -2381,6 +2441,9 @@ public sealed class LKami9GlamourHelper : ModuleBase
     /// </summary>
     private void OnFrameworkTick(Dalamud.Plugin.Services.IFramework framework)
     {
+        // 等着注入内置列表的预设：跟试穿无关，先处理（没建过试穿服务时也要跑）
+        this.TickPendingBuiltinImport();
+
         var svc = this.previewService;
         if (svc == null) return;
 
