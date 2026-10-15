@@ -15,6 +15,7 @@ using Dalamud.Interface.Utility.Raii;
 
 using FFXIVClientStructs.FFXIV.Client.Game;
 
+using Lumina.Excel;
 using Lumina.Excel.Sheets;
 
 using OmniToolbox.Common.Module.Abstractions;
@@ -37,7 +38,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     public override ModuleInfo Info { get; } = new()
     {
         Title       = "LKami9幻化助手",
-        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别装备与染剂，显示是否持有、获取方式与可交易性；支持手动修改；把识别结果写入游戏幻化模板（含自动染色）并应用；可本地试穿（不需要投影台、不需要持有装备）。",
+        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别 14 个部位（主手/副手/头部/上衣/手部/腿部/脚部/耳坠/项链/手镯/戒指/面部配饰/时尚配饰）的装备与染剂，显示是否持有、获取方式与可交易性；支持手动修改；把识别结果写入游戏幻化模板（含自动染色）并应用；可本地试穿（不需要投影台、不需要持有装备）。",
         Category    = ModuleCategory.Item,
         Author      = "LKami9",
         Commands    = [new("用上次的图重新识别", "/omni LKami9GlamourHelper scan")],
@@ -535,6 +536,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
             return;
 
         ImGui.TextDisabled("这些文字没能匹配到游戏道具，可能是 OCR 错字 —— 粘贴正确名称可把它补进结果表。");
+        ImGui.TextDisabled("（部位名 主手/副手/头部/上衣/手部/腿部/脚部/耳坠/项链/手镯/戒指/面部配饰/时尚配饰、");
+        ImGui.TextDisabled("  以及「无染色」这类染色说明，已经不会再往这里塞了）");
 
         for (var i = 0; i < this.unknowns.Count; i++)
         {
@@ -799,9 +802,15 @@ public sealed class LKami9GlamourHelper : ModuleBase
             var compact = StripNoise(new string(chars.Select(c => c.C).ToArray()));
             if (compact.Length < 2) continue;
 
-            // ① 先判是否装备名
+            // ① 先判是否装备名（把行首/行尾黏上的部位名剥掉再匹配）
             var score = 0;
-            var cand = TryItem(compact, out score);
+            var body = StripSlotLabel(compact);
+            var cand = TryItem(body, out score);
+            if (cand == null && body != compact)
+            {
+                cand = TryItem(compact, out score);           // 剥了反而更差 → 用原串再试一次
+                if (cand != null) body = compact;
+            }
             if (cand != null && score >= 70)
             {
                 var v = this.itemByName![cand];
@@ -812,7 +821,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
             // ② 否则抽染剂词（同一行可能有多颗）
             var before = this.pendingDyes.Count;
             CollectDyes(compact, chars);
-            if (this.pendingDyes.Count == before && LooksLikeName(compact))
+            if (this.pendingDyes.Count == before && LooksLikeName(compact) && !IsNoiseFragment(compact)
+                && !this.unknowns.Any(u => u.Text == compact))
                 this.unknowns.Add(new UnknownFragment { Text = compact });
         }
 
@@ -1930,10 +1940,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
             var inDresser = this.results.Count(r => this.prismBoxIndex.ContainsKey(r.ItemId));
             var inArmoire = this.results.Count(r => !this.prismBoxIndex.ContainsKey(r.ItemId) && this.armoireItemIds.Contains(r.ItemId));
             var canWrite = inDresser + inArmoire;
+            var noSlot = this.results.Count(r => PlateSlotIndexOf(r.Slot) < 0);   // 面部配饰/时尚配饰：游戏幻化模板没有这两个槽
             ImGui.TextDisabled(
-                $"容器校验：识别到 {this.results.Count} 件 —— 投影台 {inDresser} 件 + 收藏柜 {inArmoire} 件 = 可写入 {canWrite} 件"
-                + (canWrite < this.results.Count
-                    ? $"（另 {this.results.Count - canWrite} 件两个容器里都没有，需先放进投影台或收藏柜）"
+                $"容器校验：识别到 {this.results.Count} 件"
+                + (noSlot > 0 ? $"（其中 {noSlot} 件是面部配饰/时尚配饰，幻化模板没有这两个槽，不参与写入）" : "")
+                + $" —— 投影台 {inDresser} 件 + 收藏柜 {inArmoire} 件 = 可写入 {canWrite} 件"
+                + (canWrite < this.results.Count - noSlot
+                    ? $"（另 {this.results.Count - noSlot - canWrite} 件两个容器里都没有，需先放进投影台或收藏柜）"
                     : "（全部可写入）"));
         }
     }
@@ -2356,12 +2369,32 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
         var map = new Dictionary<string, (uint Id, uint Icon, string Slot, bool Untradable)>();
         var slotSheet = DalamudServices.DataManager.GetExcelSheet<EquipSlotCategory>();
+        var nFace = 0;
+        var nFashion = 0;
+
         foreach (var it in DalamudServices.DataManager.GetExcelSheet<Item>())
         {
-            if (it.RowId == 0 || it.EquipSlotCategory.RowId == 0) continue;
+            if (it.RowId == 0) continue;
             var n = it.Name.ToString();
-            if (string.IsNullOrWhiteSpace(n) || map.ContainsKey(n)) continue;
-            map[n] = (it.RowId, it.Icon, DescribeSlot(slotSheet.GetRow(it.EquipSlotCategory.RowId)), it.IsUntradable);
+            if (string.IsNullOrWhiteSpace(n)) continue;
+
+            var slot = DescribeSlot(it, slotSheet);
+            if (slot == null) continue;                       // 坐骑/宠物/情感动作… 不进索引
+
+            if (!map.ContainsKey(n))
+                map[n] = (it.RowId, it.Icon, slot, it.IsUntradable);
+            if (slot == "面部配饰") nFace++;
+            if (slot == "时尚配饰") nFashion++;
+
+            // 面部配饰的道具全名是「面部配饰：椭圆眼镜」，而石之家/OCR 上只会写「椭圆眼镜」
+            //   → 再登记一个去掉前缀的别名，否则永远匹配不上、全掉进「未识别文本」
+            var colon = n.IndexOf('：');
+            if (colon > 0 && colon < n.Length - 1)
+            {
+                var alias = n[(colon + 1)..];
+                if (!string.IsNullOrWhiteSpace(alias) && !map.ContainsKey(alias))
+                    map[alias] = (it.RowId, it.Icon, slot, it.IsUntradable);
+            }
         }
         this.itemByName = map;
 
@@ -2376,22 +2409,77 @@ public sealed class LKami9GlamourHelper : ModuleBase
         this.stainByName = stains;
         this.dyeLex = stains.Keys.Where(k => k.Length >= 2).OrderByDescending(k => k.Length).ToList();
 
-        DalamudServices.PluginLog.Information($"[幻化助手] 索引就绪：装备 {map.Count} / 染剂 {stains.Count}");
+        DalamudServices.PluginLog.Information(
+            $"[幻化助手] 索引就绪：装备 {map.Count}（面部配饰 {nFace} / 时尚配饰 {nFashion}） / 染剂 {stains.Count}");
     }
 
-    private static string DescribeSlot(EquipSlotCategory s)
+    /// <summary>
+    /// 道具 → 部位名（和游戏内叫法一致的那 14 个）。返回 null = 不是幻化部位（坐骑/宠物/情感动作…）。
+    /// 判定顺序：装备槽优先（老式眼镜这种 ESC=头部 的仍算头部，和内置一致）；
+    ///           装备槽为空时才看道具行为 → 面部配饰 / 时尚配饰。
+    /// </summary>
+    private static string? DescribeSlot(Item it, ExcelSheet<EquipSlotCategory> slotSheet)
     {
-        if (s.MainHand != 0) return "主手";
-        if (s.OffHand != 0) return "副手";
-        if (s.Head != 0) return "头部";
-        if (s.Body != 0) return "上衣";
-        if (s.Gloves != 0) return "手部";
-        if (s.Legs != 0) return "腿部";
-        if (s.Feet != 0) return "脚部";
-        if (s.Ears != 0) return "耳坠";
-        if (s.Neck != 0) return "项链";
-        if (s.Wrists != 0) return "手镯";
-        return "戒指";
+        if (it.EquipSlotCategory.RowId != 0)
+        {
+            var s = slotSheet.GetRow(it.EquipSlotCategory.RowId);
+            if (s.MainHand != 0) return "主手";
+            if (s.OffHand != 0) return "副手";
+            if (s.Head != 0) return "头部";
+            if (s.Body != 0) return "上衣";
+            if (s.Gloves != 0) return "手部";
+            if (s.Legs != 0) return "腿部";
+            if (s.Feet != 0) return "脚部";
+            if (s.Ears != 0) return "耳坠";
+            if (s.Neck != 0) return "项链";
+            if (s.Wrists != 0) return "手镯";
+            if (s.FingerL != 0 || s.FingerR != 0) return "戒指";
+        }
+
+        // 装备槽为空：看道具行为（通用 Action 行 ID，与内置 BetterGlamourManagement.ItemActionKind 同源）
+        try
+        {
+            var action = it.ItemAction.Value.Action.RowId;
+            if (action == 37312) return "面部配饰";     // 面部配饰（Glasses）
+            if (action == 20086) return "时尚配饰";     // 时尚配饰（Ornament，阳伞那类）
+        }
+        catch { }
+
+        return null;
+    }
+
+    /// <summary>石之家幻化列出的 14 个部位名（与游戏内一致）。</summary>
+    private static readonly string[] SlotLabels =
+    [
+        "面部配饰", "时尚配饰",
+        "主手", "副手", "头部", "上衣", "手部", "腿部", "脚部", "耳坠", "项链", "手镯", "戒指",
+    ];
+
+    private static bool IsSlotLabel(string s) => SlotLabels.Contains(s);
+
+    /// <summary>
+    /// 石之家常写成「头部 白色三色堇头花 煤玉黑」——OCR 拼一行后部位名会黏在装备名前，
+    /// 直接去匹配装备名必然失败。这里把行首/行尾的部位名剥掉，再拿去匹配。
+    /// </summary>
+    private static string StripSlotLabel(string s)
+    {
+        foreach (var label in SlotLabels)
+        {
+            if (s.Length > label.Length && s.StartsWith(label)) return s[label.Length..];
+            if (s.Length > label.Length && s.EndsWith(label)) return s[..^label.Length];
+        }
+        return s;
+    }
+
+    /// <summary>明显不是装备名的碎片（部位标签、染色说明、纯数字）—— 不往「未识别文本」里塞。</summary>
+    private static bool IsNoiseFragment(string s)
+    {
+        if (IsSlotLabel(s)) return true;
+        foreach (var w in SpecialLex)
+            if (s.Contains(w)) return true;
+        if (s.Contains("染色") || s.Contains("染剂") || s.Contains("颜色")) return true;
+        if (s.All(c => !char.IsLetter(c))) return true;
+        return false;
     }
 
     private static string StripNoise(string s)
