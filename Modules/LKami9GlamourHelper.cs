@@ -1998,12 +1998,10 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
     private void DrawOmniPresetSection()
     {
-        if (this.results.Count == 0) return;
-
         ImGui.Spacing();
-        ImGui.TextUnformatted("④ 存入 Omni 幻化预设");
+        ImGui.TextUnformatted("④ 导入幻化管理");
         ImGui.SameLine();
-        ImGui.TextDisabled("（写进内置「更好的幻化管理」，可本地试穿、可保存复用）");
+        ImGui.TextDisabled("（把识别结果导入内置「更好的幻化管理」，可本地试穿、不需要投影台）");
 
         if (!this.presetNameInit)
         {
@@ -2011,17 +2009,24 @@ public sealed class LKami9GlamourHelper : ModuleBase
             this.presetNameInit = true;
         }
 
-        ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
-        ImGui.InputText("预设名###omniPresetName", ref this.presetName, 64);
+        var noResult = this.results.Count == 0;
+        using (ImRaii.Disabled(noResult))
+        {
+            ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
+            ImGui.InputText("预设名###omniPresetName", ref this.presetName, 64);
 
-        ImGui.SameLine();
-        if (ImGui.Button("存为 Omni 预设")) SaveToOmniPreset();
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("把识别到的装备 + 染剂写进内置「更好的幻化管理」的预设列表\n不需要投影台、不需要真的持有装备；在那边点「试穿」即可本地预览");
+            ImGui.SameLine();
+            if (ImGui.Button("导入幻化管理")) SaveToOmniPreset();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("把识别到的装备 + 染剂导入内置「更好的幻化管理」的预设列表\n不需要投影台、不需要真的持有装备；在那边点「试穿」即可本地预览");
+        }
 
         ImGui.SameLine();
         if (ImGui.Button("打开幻化管理")) OpenOmniGlamourManager();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("打开内置「更好的幻化管理」界面");
+
+        if (noResult)
+            ImGui.TextDisabled("先识别一张图（② 识别结果有内容），「导入幻化管理」才会可用。");
 
         if (!string.IsNullOrEmpty(this.presetStatus))
             ImGui.TextWrapped(this.presetStatus);
@@ -2165,10 +2170,38 @@ public sealed class LKami9GlamourHelper : ModuleBase
             return;
         }
 
-        this.presetStatus = $"已存入 Omni 预设「{name}」：{count} 件装备（{this.presetDetail}）。" +
-                            $"来源：{how}。在「更好的幻化管理」里即可看到并本地试穿。";
+        this.presetStatus = $"已导入「{name}」：{count} 件装备（{this.presetDetail}）。" +
+                            $"来源：{how}。点右边「打开幻化管理」即可看到并试穿。";
         DalamudServices.PluginLog.Information(
-            $"[幻化助手] Omni 预设已保存：{name} / {count} 件 / 来源={how} / 槽位映射：{this.presetDetail}");
+            $"[幻化助手] 已导入幻化管理：{name} / {count} 件 / 来源={how} / 槽位映射：{this.presetDetail}");
+
+        // 管理界面若已打开，把新列表推过去，免得要关了再开
+        this.TryRefreshOmniManagerUi();
+    }
+
+    /// <summary>把最新的预设列表推给已打开的内置管理界面（失败无所谓，下次打开也会读到）。</summary>
+    private void TryRefreshOmniManagerUi()
+    {
+        try
+        {
+            foreach (var module in OmniModules("BetterGlamourManagement"))
+            {
+                var mt = module.GetType();
+                var cfg = mt.GetField("config", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(module);
+                var ui = mt.GetField("managerNativeUI", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(module);
+                if (cfg == null || ui == null) continue;
+
+                var presets = cfg.GetType().GetProperty("Presets")?.GetValue(cfg);
+                ui.GetType().GetMethod("UpdateData", BindingFlags.Instance | BindingFlags.Public)
+                  ?.Invoke(ui, [presets, 0]);
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            // 内置 UpdateData 会先刷新窗口标题，窗口没开时那步会抛（内置的已知问题）——不影响数据
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 刷新幻化管理界面失败（数据已写入，忽略）");
+        }
     }
 
     /// <summary>
@@ -2176,6 +2209,40 @@ public sealed class LKami9GlamourHelper : ModuleBase
     /// 宿主保存时会把整份内存配置落盘 —— 所以必须改内存，光改文件会被覆盖。
     /// </summary>
     private string TryAppendToLiveOmniConfig(Dictionary<string, object?> preset)
+    {
+        foreach (var module in OmniModules("BetterGlamourManagement"))
+        {
+            var mt = module.GetType();
+
+            var config = mt.GetField("config",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(module);
+            if (config == null) continue;
+
+            var presetsProp = config.GetType().GetProperty("Presets");
+            if (presetsProp?.GetValue(config) is not System.Collections.IList presets) continue;
+
+            var typed = ToStronglyTypedPreset(mt, preset);
+            if (typed == null) continue;      // 类型没找全 → 交给文件兜底
+            presets.Add(typed);
+            DalamudServices.PluginLog.Information(
+                $"[幻化助手] 内置幻化管理实例已找到，预设追加进内存（现共 {presets.Count} 条）");
+
+            // 让宿主把内存配置落盘
+            try
+            {
+                var saveField = mt.GetField("saveConfig",
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                if (saveField?.GetValue(module) is System.Action save) { save(); return "内置实例（内存）+ 已落盘"; }
+            }
+            catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 落盘调用失败，仅内存生效"); }
+
+            return "内置实例（内存）";
+        }
+        return "";
+    }
+
+    /// <summary>按类型名在宿主模块列表里找模块实例。</summary>
+    private static IEnumerable<object> OmniModules(string typeName)
     {
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
@@ -2188,37 +2255,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
             if (modules == null) continue;
 
             foreach (var module in modules)
-            {
-                if (module == null) continue;
-                var mt = module.GetType();
-                if (mt.Name != "BetterGlamourManagement") continue;
-
-                var configField = mt.GetField("config",
-                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                var config = configField?.GetValue(module);
-                if (config == null) continue;
-
-                var presetsProp = config.GetType().GetProperty("Presets");
-                if (presetsProp?.GetValue(config) is not System.Collections.IList presets) continue;
-
-                var typed = ToStronglyTypedPreset(mt, preset);
-                if (typed == null) continue;      // 类型没找全 → 交给文件兜底
-                presets.Add(typed);
-                DalamudServices.PluginLog.Information(
-                    $"[幻化助手] 内置幻化管理实例已找到，预设追加进内存（现共 {presets.Count} 条）");
-                // 让宿主把内存配置落盘
-                try
-                {
-                    var saveField = mt.GetField("saveConfig",
-                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                    if (saveField?.GetValue(module) is System.Action save) { save(); return "内置实例（内存）+ 已落盘"; }
-                }
-                catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 落盘调用失败，仅内存生效"); }
-
-                return "内置实例（内存）";
-            }
+                if (module != null && module.GetType().Name == typeName) yield return module;
         }
-        return "";
     }
 
     private static object? liveModuleCache;
@@ -2398,32 +2436,47 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
     }
 
-    /// <summary>打开内置「更好的幻化管理」界面（反射调用公开入口）。</summary>
+    /// <summary>
+    /// 打开内置「更好的幻化管理」界面。
+    /// 内置的 <c>OpenManager()</c> 会在开窗前先刷窗口标题，那一步在 OmniToolbox 1.1.7.0 会抛
+    /// NullReferenceException（KamiToolKit 的 WindowNode.SetTitle），窗口因此打不开。
+    /// 它抛之前数据已经塞进界面对象了，所以这里退一步直接调管理界面的 Open()。
+    /// </summary>
     private void OpenOmniGlamourManager()
     {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        foreach (var module in OmniModules("BetterGlamourManagement"))
         {
-            var t = asm.GetType("OmniToolbox.TreePublic.BetterGlamourManagement", false);
-            if (t == null) continue;
+            var mt = module.GetType();
 
             try
             {
-                var managerType = asm.GetType("OmniToolbox.TreeHouse.TreeHouseManager", false);
-                var method = t.GetMethod("OpenManager", BindingFlags.Instance | BindingFlags.Public);
-                if (managerType == null || method == null) continue;
-
-                var modules = GetLiveModules(managerType);
-                if (modules == null) continue;
-
-                foreach (var module in modules)
-                {
-                    if (module == null || module.GetType().Name != "BetterGlamourManagement") continue;
-                    method.Invoke(module, null);
-                    this.presetStatus = "已请求打开内置「更好的幻化管理」。";
-                    return;
-                }
+                mt.GetMethod("OpenManager", BindingFlags.Instance | BindingFlags.Public)?.Invoke(module, null);
+                this.presetStatus = "已打开内置「更好的幻化管理」。";
+                return;
             }
-            catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 打开内置幻化管理失败"); }
+            catch (Exception ex)
+            {
+                DalamudServices.PluginLog.Information(ex, "[幻化助手] OpenManager() 抛异常，改走备用方式打开");
+
+                try
+                {
+                    var ui = mt.GetField("managerNativeUI",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(module);
+                    if (ui != null)
+                    {
+                        ui.GetType().GetMethod("Open", BindingFlags.Instance | BindingFlags.Public)?.Invoke(ui, null);
+                        this.presetStatus = "内置 OpenManager() 自己报错（它的已知问题），已用备用方式打开管理界面。";
+                        return;
+                    }
+                }
+                catch (Exception ex2)
+                {
+                    DalamudServices.PluginLog.Information(ex2, "[幻化助手] 备用打开方式也失败");
+                }
+
+                this.presetStatus = "打开失败：内置「更好的幻化管理」的打开入口报错（OmniToolbox 自身问题，见 /xllog）。";
+                return;
+            }
         }
         this.presetStatus = "没找到内置「更好的幻化管理」的运行实例（插件没启用？）。";
     }
