@@ -5,11 +5,11 @@
       "InternalName": "LKami9GlamourHelper",
       "Name": "LKami9幻化助手",
       "Author": "LKami9",
-      "Description": "从石之家幻化截图（剪贴板或图片文件）识别装备与染剂；显示持有情况、获取方式（最终幻想XIV中文维基）与可交易性；支持手动斧正；可写入游戏内幻化模板（含自动染色）并应用。文字颜色跟随 Omni 主题。",
-      "Version": "1.11.2",
+      "Description": "从石之家幻化截图（剪贴板或图片文件）识别装备与染剂；显示持有情况、获取方式（最终幻想XIV中文维基）与可交易性；支持手动斧正；可写入游戏内幻化模板（含自动染色）并应用；也可把识别结果导入内置「更好的幻化管理」的预设（本地试穿，不需要投影台）。文字颜色跟随 Omni 主题。",
+      "Version": "1.12.0",
       "MinimumOmniVersion": "1.1.7.0",
       "File": "Modules/LKami9GlamourHelper.cs",
-      "Sha256": "DD43617CAE49B903FB2DD9D21E9D8963C6B16D7CE0D1A79ED81EF3352F91343F"
+      "Sha256": "32D4E625033A6A4689A7091C94190B085B6455C880D1C6A9D55130CCB1BA6236"
     }
   ]
 }

@@ -65,6 +65,11 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private string pathBuffer = "";
     private bool pathInit;
 
+    // ── 导入幻化管理 ──
+    private string presetName = "";
+    private bool presetNameInit;
+    private string presetStatus = "";
+
     // ── 文字颜色：一律跟随 Omni 主题（不再单独配置）──
     //    取 OmniTheme.Tokens，切换主题/明暗时本模块会跟着变。
 
@@ -137,6 +142,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.Separator();
         DrawResultSection();
         DrawPlateSection();
+        DrawOmniPresetSection();
         return false;
     }
 
@@ -1905,6 +1911,228 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private void LoadPrismBoxIndexIfNeeded()
     {
         if (this.prismBoxIndex.Count == 0) LoadPrismBoxIndex();
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  ④ 导入内置「更好的幻化管理」（**只读写配置文件，不碰宿主内存**）
+    //    落点：%APPDATA%\XIVLauncherCN\pluginConfigs\OmniToolbox\TreeHouse\
+    //            BetterGlamourManagement.json  →  { Enabled, Config: { Presets: [ … ] } }
+    //
+    //    槽位号 = 游戏幻化模板槽位号，已用道具名逐条核对（勿凭记忆改）：
+    //      0 主手  1 副手  2 头部  3 上衣  4 手部  5 腿部  6 脚部
+    //      7 耳坠  8 项链  9 手镯  10 戒指(右)  11 戒指(左)
+    //    核对依据：16986 血族剑→0 / 21011 圣母盾→1 / 16622 头花→2 / 50268 礼裙→3 /
+    //             32326 套袖→4 / 50264 短裙→5(腿) / 14976 礼鞋→6 / 9293 耳环→7 /
+    //             9292 项链→8 / 9294 手镯→9 / 9295 戒指→10、11
+    //
+    //    ⚠ 这是宿主**启动时**读的文件 → 写完必须在 Dalamud 插件列表里把 OmniToolbox
+    //      禁用再启用（或重启游戏），新预设才会出现在内置界面里。
+    //    ⚠ 不去反射宿主的运行时对象（宿主把整份配置缓存在内存里，动它风险太大 —— 见交接文档）。
+    // ══════════════════════════════════════════════════════════
+
+    private static string OmniGlamourConfigPath() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "XIVLauncherCN", "pluginConfigs", "OmniToolbox", "TreeHouse", "BetterGlamourManagement.json");
+
+    /// <summary>识别槽位名 → 预设槽位号（无对应槽位返回 -1，例如副手）。</summary>
+    private static int OmniSlotOf(string slot) => slot switch
+    {
+        "主手" => 0,
+        "头部" => 2, "上衣" => 3, "手部" => 4, "腿部" => 5, "脚部" => 6,
+        "耳坠" => 7, "项链" => 8, "手镯" => 9,
+        "戒指" => 10,
+        _ => -1,
+    };
+
+    /// <summary>取一行的两个染剂 ID（同一套 Stain 体系，可直接搬）。</summary>
+    private static (byte S0, byte S1) DyePair(SlotResult r)
+    {
+        byte s0 = 0, s1 = 0;
+        var dyes = r.Dyes.Where(d => !d.IsEmpty).Take(2).ToList();
+        if (dyes.Count > 0 && dyes[0].Id < 256) s0 = (byte)dyes[0].Id;
+        if (dyes.Count > 1 && dyes[1].Id < 256) s1 = (byte)dyes[1].Id;
+        return (s0, s1);
+    }
+
+    /// <summary>识别结果 → 预设条目（同槽位去重；第二枚戒指落到 11 号槽）。</summary>
+    private List<Dictionary<string, object?>> BuildOmniItems(List<string> detail)
+    {
+        var items = new List<Dictionary<string, object?>>();
+        var placed = new HashSet<string>();
+
+        foreach (var r in this.results)
+        {
+            var slot = OmniSlotOf(r.Slot);
+            if (slot < 0 || r.ItemId == 0) continue;
+            if (slot == 10) { if (!placed.Add("戒指")) continue; }   // 第二枚戒指留给下面
+            else if (!placed.Add(r.Slot)) continue;
+
+            var (s0, s1) = DyePair(r);
+            items.Add(new Dictionary<string, object?>
+            {
+                ["Slot"] = slot, ["ItemID"] = r.ItemId, ["Stain0"] = s0, ["Stain1"] = s1,
+            });
+            detail.Add($"{r.Slot}→{slot}");
+        }
+
+        var rings = this.results.Where(r => r.Slot == "戒指" && r.ItemId != 0).ToList();
+        if (rings.Count > 1)
+        {
+            var (s0, s1) = DyePair(rings[1]);
+            items.Add(new Dictionary<string, object?>
+            {
+                ["Slot"] = 11, ["ItemID"] = rings[1].ItemId, ["Stain0"] = s0, ["Stain1"] = s1,
+            });
+            detail.Add("戒指(第2枚)→11");
+        }
+        return items;
+    }
+
+    /// <summary>把识别结果追加成一条预设，写进内置幻化管理的配置文件。</summary>
+    private void ImportToOmniGlamour()
+    {
+        if (this.results.Count == 0)
+        {
+            this.presetStatus = "还没有识别结果，先识别一张图。";
+            return;
+        }
+
+        var name = string.IsNullOrWhiteSpace(this.presetName)
+            ? $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}"
+            : this.presetName.Trim();
+
+        var detail = new List<string>();
+        var items = BuildOmniItems(detail);
+        if (items.Count == 0)
+        {
+            this.presetStatus = "识别结果里没有可写入的槽位（副手无对应槽位，已跳过）。";
+            return;
+        }
+
+        var path = OmniGlamourConfigPath();
+        try
+        {
+            var preset = new Dictionary<string, object?>
+            {
+                ["Name"] = name,
+                ["GearsetIndex"] = -1,
+                ["GlassesID"] = 0,
+                ["HairstyleID"] = 0,
+                ["Items"] = items,
+            };
+
+            // 读原文件（保留其它键与已有预设的原始写法，只往后追加一条）
+            JsonDocument doc;
+            if (File.Exists(path))
+                doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+            else
+                doc = JsonDocument.Parse("{\"Enabled\": true, \"Config\": {\"Presets\": []}}");
+            using (doc)
+            {
+                var root = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(doc.RootElement.GetRawText()) ?? [];
+                var cfg = root.TryGetValue("Config", out var cfgEl) && cfgEl.ValueKind == JsonValueKind.Object
+                    ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(cfgEl.GetRawText()) ?? []
+                    : [];
+
+                var presets = new List<object>();
+                var sameName = 0;
+                if (cfg.TryGetValue("Presets", out var pr) && pr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var p in pr.EnumerateArray())
+                    {
+                        if (p.ValueKind == JsonValueKind.Object
+                            && p.TryGetProperty("Name", out var n) && n.GetString() == name)
+                            sameName++;
+                        presets.Add(p.GetRawText());     // 原样保留
+                    }
+                }
+                var countBefore = presets.Count;
+                presets.Add(preset);
+
+                var tokens = presets
+                    .Select(p => p is string raw
+                        ? JsonDocument.Parse(raw).RootElement.Clone()
+                        : JsonSerializer.SerializeToElement(p))
+                    .ToList();
+
+                var output = new Dictionary<string, object?>
+                {
+                    ["Enabled"] = !root.TryGetValue("Enabled", out var en) || en.ValueKind != JsonValueKind.False,
+                    ["Config"] = new Dictionary<string, object?> { ["Presets"] = tokens },
+                };
+
+                var json = JsonSerializer.Serialize(output, new JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    // 默认会把中文转成 \uXXXX —— 这文件是给人看的，保留原文
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+                });
+
+                if (File.Exists(path))
+                {
+                    try { File.Copy(path, path + ".bak", true); }
+                    catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 预设配置备份失败（继续写）"); }
+                }
+
+                for (var attempt = 1; ; attempt++)
+                {
+                    try { File.WriteAllText(path, json, new UTF8Encoding(false)); break; }
+                    catch (IOException) when (attempt < 5) { System.Threading.Thread.Sleep(150); }
+                }
+
+                this.presetStatus =
+                    $"已写入「{name}」：{items.Count} 件（{string.Join("、", detail)}）。" +
+                    $"现共 {countBefore + 1} 条预设" + (sameName > 0 ? $"（同名原本已有 {sameName} 条）" : "") + "。\n" +
+                    "新预设要等内置功能重新读取配置：在 Dalamud 插件列表里把 OmniToolbox 禁用再启用（或重启游戏），" +
+                    "然后打开「更好的幻化管理」即可看到并试穿。注意重载会清空本模块当前的识别结果。";
+
+                DalamudServices.PluginLog.Information(
+                    $"[幻化助手] 已写入幻化预设：{name} / {items.Count} 件 / 映射 {string.Join("、", detail)} / 文件 {path}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写幻化预设失败");
+            this.presetStatus = "写入失败：" + ex.Message;
+        }
+    }
+
+    private void DrawOmniPresetSection()
+    {
+        ImGui.Spacing();
+        ImGui.TextUnformatted("④ 导入幻化管理");
+        ImGui.SameLine();
+        ImGui.TextDisabled("（写进内置「更好的幻化管理」，可本地试穿；不需要投影台、不需要持有装备）");
+
+        if (!this.presetNameInit)
+        {
+            this.presetName = $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}";
+            this.presetNameInit = true;
+        }
+
+        var noResult = this.results.Count == 0;
+        using (ImRaii.Disabled(noResult))
+        {
+            ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
+            ImGui.InputText("预设名###omniPresetName", ref this.presetName, 64);
+
+            ImGui.SameLine();
+            if (ImGui.Button("导入幻化管理")) ImportToOmniGlamour();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("把识别到的装备 + 染剂追加成一条预设，写入内置「更好的幻化管理」的配置\n" +
+                                 "写完后需要把 OmniToolbox 重载一次它才会读到（会清空本模块当前识别结果）");
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("打开幻化管理"))
+            DalamudServices.CommandManager.ProcessCommand("/omni 幻化管理");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("等价于在聊天框输入 /omni 幻化管理");
+
+        if (noResult)
+            ImGui.TextDisabled("先识别一张图（② 识别结果里有内容），「导入幻化管理」才会可用。");
+
+        if (!string.IsNullOrEmpty(this.presetStatus))
+            ImGui.TextWrapped(this.presetStatus);
     }
 
     // ══════════════════════════════════════════════════════════
