@@ -2031,11 +2031,6 @@ public sealed class LKami9GlamourHelper : ModuleBase
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("恢复试穿前的样子");
         }
 
-        ImGui.SameLine();
-        if (ImGui.Button("打开幻化管理"))
-            DalamudServices.CommandManager.ProcessCommand("/omni 幻化管理");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("打开内置「更好的幻化管理」（等价于在聊天框输入 /omni 幻化管理）");
-
         if (noResult)
             ImGui.TextDisabled("先识别一张图（② 识别结果里有内容），「试穿这套」才会可用。");
 
