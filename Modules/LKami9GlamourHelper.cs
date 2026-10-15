@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -63,6 +64,12 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private readonly List<string> editCandidates = [];
     private string pathBuffer = "";
     private bool pathInit;
+
+    // ── Omni 幻化预设 ──
+    private string presetName = "";
+    private bool presetNameInit;
+    private string presetStatus = "";
+    private string presetDetail = "";
 
     /// <summary>警示色（默认橙黄）—— 取自 config，越界自动回退默认值。</summary>
     private System.Numerics.Vector4 WarnVec
@@ -171,6 +178,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.Separator();
         DrawResultSection();
         DrawPlateSection();
+        DrawOmniPresetSection();
         return false;
     }
 
@@ -1982,6 +1990,442 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private void LoadPrismBoxIndexIfNeeded()
     {
         if (this.prismBoxIndex.Count == 0) LoadPrismBoxIndex();
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  ④ 存入 Omni 幻化预设（不需要投影台、不需要持有装备）
+    // ══════════════════════════════════════════════════════════
+
+    private void DrawOmniPresetSection()
+    {
+        if (this.results.Count == 0) return;
+
+        ImGui.Spacing();
+        ImGui.TextUnformatted("④ 存入 Omni 幻化预设");
+        ImGui.SameLine();
+        ImGui.TextDisabled("（写进内置「更好的幻化管理」，可本地试穿、可保存复用）");
+
+        if (!this.presetNameInit)
+        {
+            this.presetName = $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}";
+            this.presetNameInit = true;
+        }
+
+        ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("预设名###omniPresetName", ref this.presetName, 64);
+
+        ImGui.SameLine();
+        if (ImGui.Button("存为 Omni 预设")) SaveToOmniPreset();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("把识别到的装备 + 染剂写进内置「更好的幻化管理」的预设列表\n不需要投影台、不需要真的持有装备；在那边点「试穿」即可本地预览");
+
+        ImGui.SameLine();
+        if (ImGui.Button("打开幻化管理")) OpenOmniGlamourManager();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("打开内置「更好的幻化管理」界面");
+
+        if (!string.IsNullOrEmpty(this.presetStatus))
+            ImGui.TextWrapped(this.presetStatus);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  联动内置「更好的幻化管理」：把识别结果存成 Omni 幻化预设
+    //    数据落点（与内置功能共用同一份配置）：
+    //      %APPDATA%\XIVLauncherCN\pluginConfigs\OmniToolbox\TreeHouse\
+    //        BetterGlamourManagement.json   →   { Enabled, Config: { Presets: [ … ] } }
+    //    槽位编号（0~12，13 槽）**与游戏幻化模板槽位号完全一致**（已用道具名逐条核对）：
+    //      0 主手  1 副手  2 头部  3 上衣  4 手部  5 腿部  6 脚部
+    //      7 耳坠  8 项链  9 手镯  10 戒指(右) 11 戒指(左) 12 戒指(第三槽)
+    //    核对依据（玩家自己的预设 + Item 表）：
+    //      16986 血族剑→0 / 21011 圣母盾→1 / 16622 头花→2 / 50268 礼裙→3
+    //      32326 套袖→4 / 50264 短裙→5(腿) / 14976 礼鞋→6 / 9293 耳环→7
+    //      9292 项链→8 / 9294 手镯→9 / 9295 戒指→10(和预设里 Slot 10/11 一致)
+    //    · 内置界面显示的 10 个部件 = 2/3/4/6/7/8/9/10/11/12（界面上拿不到 0/1/5，但字段合法、可读写）
+    //    · 预设里的染剂是同一个 Stain ID 体系，可直接搬
+    //    · 不需要投影台、不需要真的持有装备（本地试穿）
+    // ══════════════════════════════════════════════════════════
+
+    /// <summary>识别槽位名 → Omni 预设槽位编号（不适用返回 -1，例如副手）。</summary>
+    /// <remarks>
+    /// 编号 = 游戏幻化模板槽位号（已用道具名逐条核对，勿凭记忆改）：
+    ///   Omni 10 = 手镯、Omni 11 = 戒指；写成 10=戒指 会让项链/手镯整体错位。
+    /// </remarks>
+    private static int OmniSlotIndexOf(string slot) => slot switch
+    {
+        "主手" => 0,
+        "头部" => 2, "上衣" => 3, "手部" => 4, "腿部" => 5, "脚部" => 6,
+        "耳坠" => 7, "项链" => 8, "手镯" => 9,
+        "戒指" => 10,
+        _ => -1,
+    };
+
+    /// <summary>取一行的两个染剂 ID（染剂是同一个 Stain 体系，可直接搬）。</summary>
+    private static (byte S0, byte S1) DyePairOf(SlotResult r)
+    {
+        byte s0 = 0, s1 = 0;
+        var dyes = r.Dyes.Where(d => !d.IsEmpty).Take(2).ToList();
+        if (dyes.Count > 0 && dyes[0].Id < 256) s0 = (byte)dyes[0].Id;
+        if (dyes.Count > 1 && dyes[1].Id < 256) s1 = (byte)dyes[1].Id;
+        return (s0, s1);
+    }
+
+    /// <summary>把识别结果组装成一条 Omni 预设（槽位/道具/染剂）。</summary>
+    private Dictionary<string, object?> BuildOmniPreset(string name)
+    {
+        var items = new List<Dictionary<string, object?>>();
+        var detail = new List<string>();
+        var unmatched = new List<string>();
+
+        var placed = new HashSet<string>();
+        foreach (var r in this.results)
+        {
+            var slot = OmniSlotIndexOf(r.Slot);
+            if (slot < 0) { unmatched.Add($"{r.Slot}（无对应槽位）"); continue; }
+            if (r.ItemId == 0) continue;
+
+            // 同槽位只放一件；「戒指」是唯一有第二个槽位的部位，留给后面单独处理
+            if (slot == 10) { if (placed.Contains("戒指")) continue; placed.Add("戒指"); }
+            else if (!placed.Add(r.Slot)) continue;
+
+            var (s0, s1) = DyePairOf(r);
+            items.Add(new Dictionary<string, object?>
+            {
+                ["Slot"] = slot,
+                ["ItemID"] = r.ItemId,
+                ["Stain0"] = s0,
+                ["Stain1"] = s1,
+            });
+            detail.Add($"{r.Slot}→{slot}:{r.ItemId}");
+        }
+
+        // 第二枚戒指：识别出的「戒指」里第 2 件落到 11 号槽（左手戒指位）
+        var rings = this.results.Where(r => r.Slot == "戒指" && r.ItemId != 0).ToList();
+        if (rings.Count > 1)
+        {
+            var (s0, s1) = DyePairOf(rings[1]);
+            items.Add(new Dictionary<string, object?>
+            {
+                ["Slot"] = 11,
+                ["ItemID"] = rings[1].ItemId,
+                ["Stain0"] = s0,
+                ["Stain1"] = s1,
+            });
+            detail.Add($"戒指(第2枚)→11:{rings[1].ItemId}");
+        }
+
+        this.presetDetail = string.Join(", ", detail) + (unmatched.Count > 0 ? "；跳过 " + string.Join("、", unmatched) : "");
+
+        return new Dictionary<string, object?>
+        {
+            ["Name"] = name,
+            ["GearsetIndex"] = -1,
+            ["GlassesID"] = 0,
+            ["HairstyleID"] = 0,
+            ["Items"] = items,
+        };
+    }
+
+    /// <summary>把预设写进内置「更好的幻化管理」：优先写活的内存实例，失败则直接写配置文件。</summary>
+    private void SaveToOmniPreset()
+    {
+        if (this.results.Count == 0)
+        {
+            this.presetStatus = "还没有识别结果，先识别一张图。";
+            return;
+        }
+
+        var name = string.IsNullOrWhiteSpace(this.presetName)
+            ? $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}"
+            : this.presetName.Trim();
+
+        var preset = BuildOmniPreset(name);
+        var count = ((List<Dictionary<string, object?>>)preset["Items"]!).Count;
+        if (count == 0)
+        {
+            this.presetStatus = "识别结果里没有可写入预设的槽位（副手等无对应槽位已跳过）。";
+            return;
+        }
+
+        string how;
+        try
+        {
+            how = this.TryAppendToLiveOmniConfig(preset);
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写内置幻化管理内存实例失败，转写配置文件");
+            how = "";
+        }
+
+        if (string.IsNullOrEmpty(how))
+            how = this.TryAppendToOmniConfigFile(preset);
+
+        if (string.IsNullOrEmpty(how))
+        {
+            this.presetStatus = "保存失败：既没找到内置幻化管理的运行实例，也没写进配置文件。看 /xllog 的 [幻化助手] 行。";
+            return;
+        }
+
+        this.presetStatus = $"已存入 Omni 预设「{name}」：{count} 件装备（{this.presetDetail}）。" +
+                            $"来源：{how}。在「更好的幻化管理」里即可看到并本地试穿。";
+        DalamudServices.PluginLog.Information(
+            $"[幻化助手] Omni 预设已保存：{name} / {count} 件 / 来源={how} / 槽位映射：{this.presetDetail}");
+    }
+
+    /// <summary>
+    /// 优先把预设追加进内置模块正在用的内存配置（追加后立刻可见，不需要重载插件）。
+    /// 宿主保存时会把整份内存配置落盘 —— 所以必须改内存，光改文件会被覆盖。
+    /// </summary>
+    private string TryAppendToLiveOmniConfig(Dictionary<string, object?> preset)
+    {
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type? managerType;
+            try { managerType = asm.GetType("OmniToolbox.TreeHouse.TreeHouseManager", false); }
+            catch { continue; }
+            if (managerType == null) continue;
+
+            var modules = GetLiveModules(managerType);
+            if (modules == null) continue;
+
+            foreach (var module in modules)
+            {
+                if (module == null) continue;
+                var mt = module.GetType();
+                if (mt.Name != "BetterGlamourManagement") continue;
+
+                var configField = mt.GetField("config",
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                var config = configField?.GetValue(module);
+                if (config == null) continue;
+
+                var presetsProp = config.GetType().GetProperty("Presets");
+                if (presetsProp?.GetValue(config) is not System.Collections.IList presets) continue;
+
+                var typed = ToStronglyTypedPreset(mt, preset);
+                if (typed == null) continue;      // 类型没找全 → 交给文件兜底
+                presets.Add(typed);
+                DalamudServices.PluginLog.Information(
+                    $"[幻化助手] 内置幻化管理实例已找到，预设追加进内存（现共 {presets.Count} 条）");
+                // 让宿主把内存配置落盘
+                try
+                {
+                    var saveField = mt.GetField("saveConfig",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    if (saveField?.GetValue(module) is System.Action save) { save(); return "内置实例（内存）+ 已落盘"; }
+                }
+                catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 落盘调用失败，仅内存生效"); }
+
+                return "内置实例（内存）";
+            }
+        }
+        return "";
+    }
+
+    private static object? liveModuleCache;
+
+    /// <summary>取宿主当前加载的模块列表（带缓存，避免每帧重复扫程序集）。</summary>
+    private static System.Collections.IEnumerable? GetLiveModules(Type managerType)
+    {
+        var manager = liveModuleCache ?? FindLiveInstance(managerType);
+        if (manager == null) return null;
+
+        var prop = managerType.GetProperty("Modules",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        try
+        {
+            if (prop?.GetValue(manager) is System.Collections.IEnumerable list)
+            {
+                liveModuleCache = manager;
+                return list;
+            }
+        }
+        catch { }
+        liveModuleCache = null;
+        return null;
+    }
+
+    /// <summary>
+    /// 找宿主里那个管理器的活动实例（宿主没有公开入口，只能扫静态字段）。
+    /// 宿主会把整份模块配置缓存在内存里、保存时整份落盘 —— 所以只改配置文件会被覆盖，
+    /// 必须拿到这个实例改内存。扫不到就返回 null，调用方退回写文件。
+    /// </summary>
+    private static object? FindLiveInstance(Type managerType)
+    {
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type? pluginType;
+            try { pluginType = asm.GetType("OmniToolbox.Host.Plugin", false); }
+            catch { continue; }
+            if (pluginType == null || pluginType.Assembly != managerType.Assembly) continue;
+
+            const BindingFlags flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+            foreach (var t in pluginType.Assembly.GetTypes())
+            {
+                // 先把该类型的静态实例收进来，再连它的实例字段一起扫一层
+                foreach (var f in t.GetFields(flags))
+                {
+                    object? root;
+                    try { root = f.GetValue(null); }
+                    catch { continue; }
+                    if (root == null) continue;
+
+                    if (managerType.IsInstanceOfType(root)) return root;
+
+                    try
+                    {
+                        if (root.GetType().Assembly == managerType.Assembly)
+                        {
+                            var hit = ScanFor(root, managerType, 0);
+                            if (hit != null) return hit;
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>浅扫对象字段，找指定类型的实例（宿主层级很浅）。</summary>
+    private static object? ScanFor(object root, Type want, int depth)
+    {
+        if (depth > 2) return null;
+        foreach (var f in root.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+        {
+            object? v;
+            try { v = f.GetValue(root); }
+            catch { continue; }
+            if (v == null) continue;
+            if (want.IsInstanceOfType(v)) return v;
+            if (v.GetType().IsPrimitive || v is string) continue;
+            var nested = ScanFor(v, want, depth + 1);
+            if (nested != null) return nested;
+        }
+        return null;
+    }
+
+    /// <summary>用内置模块自己的类型实例化预设，保证内存对象类型一致。</summary>
+    private static object? ToStronglyTypedPreset(Type moduleType, Dictionary<string, object?> preset)
+    {
+        var asm = moduleType.Assembly;
+        var presetType = asm.GetType("OmniToolbox.TreePublic.BetterGlamourPreset");
+        var itemType = asm.GetType("OmniToolbox.TreePublic.BetterGlamourItem");
+        if (presetType == null || itemType == null) return null;
+
+        var obj = Activator.CreateInstance(presetType);
+        presetType.GetProperty("Name")?.SetValue(obj, preset["Name"]);
+        presetType.GetProperty("GearsetIndex")?.SetValue(obj, preset["GearsetIndex"]);
+        presetType.GetProperty("GlassesID")?.SetValue(obj, (ushort)0);
+        presetType.GetProperty("HairstyleID")?.SetValue(obj, 0u);
+
+        var listProp = presetType.GetProperty("Items");
+        if (listProp?.GetValue(obj) is System.Collections.IList items)
+        {
+            foreach (var it in (List<Dictionary<string, object?>>)preset["Items"]!)
+            {
+                var item = Activator.CreateInstance(itemType);
+                itemType.GetProperty("Slot")?.SetValue(item, it["Slot"]);
+                itemType.GetProperty("ItemID")?.SetValue(item, it["ItemID"]);
+                itemType.GetProperty("Stain0")?.SetValue(item, it["Stain0"]);
+                itemType.GetProperty("Stain1")?.SetValue(item, it["Stain1"]);
+                items.Add(item);
+            }
+        }
+        return obj;
+    }
+
+    /// <summary>兜底：直接读写内置幻化管理的配置文件（重启插件后生效）。</summary>
+    private string TryAppendToOmniConfigFile(Dictionary<string, object?> preset)
+    {
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "XIVLauncherCN", "pluginConfigs", "OmniToolbox", "TreeHouse", "BetterGlamourManagement.json");
+
+        try
+        {
+            using var doc = File.Exists(path)
+                ? JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8))
+                : JsonDocument.Parse("{\"Enabled\": true, \"Config\": {\"Presets\": []}}");
+
+            var root = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(doc.RootElement.GetRawText())
+                       ?? [];
+            var cfgDoc = root.TryGetValue("Config", out var cfgEl) ? cfgEl : default;
+            var cfg = cfgDoc.ValueKind == JsonValueKind.Object
+                ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(cfgDoc.GetRawText()) ?? []
+                : [];
+
+            var presets = new List<object>();
+            if (cfg.TryGetValue("Presets", out var pr) && pr.ValueKind == JsonValueKind.Array)
+                foreach (var p in pr.EnumerateArray())
+                    presets.Add(p.GetRawText());
+            presets.Add(preset);
+
+            // Presets 内的旧项是 JSON 原文，用 Raw 包裹避免被二次转义
+            var presetTokens = presets.Select(p => p is string raw ? JsonDocument.Parse(raw).RootElement.Clone()
+                                                                  : JsonSerializer.SerializeToElement(p)).ToList();
+
+            var output = new Dictionary<string, object?>
+            {
+                ["Enabled"] = root.TryGetValue("Enabled", out var en) && en.ValueKind == JsonValueKind.True,
+                ["Config"] = new Dictionary<string, object?> { ["Presets"] = presetTokens },
+            };
+
+            var json = JsonSerializer.Serialize(output, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                // 默认会把中文转成 \uXXXX —— 配置是给人看的，保留原文
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            });
+
+            // 备份原文件（只留最近一份）
+            if (File.Exists(path))
+            {
+                try { File.Copy(path, path + ".bak", true); }
+                catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 预设配置备份失败（继续）"); }
+            }
+
+            for (var attempt = 1; ; attempt++)
+            {
+                try { File.WriteAllText(path, json, new UTF8Encoding(false)); return path; }
+                catch (IOException) when (attempt < 5) { System.Threading.Thread.Sleep(150); }
+            }
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写内置幻化预设配置文件失败");
+            this.presetStatus = "写配置文件失败：" + ex.Message;
+            return "";
+        }
+    }
+
+    /// <summary>打开内置「更好的幻化管理」界面（反射调用公开入口）。</summary>
+    private void OpenOmniGlamourManager()
+    {
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var t = asm.GetType("OmniToolbox.TreePublic.BetterGlamourManagement", false);
+            if (t == null) continue;
+
+            try
+            {
+                var managerType = asm.GetType("OmniToolbox.TreeHouse.TreeHouseManager", false);
+                var method = t.GetMethod("OpenManager", BindingFlags.Instance | BindingFlags.Public);
+                if (managerType == null || method == null) continue;
+
+                var modules = GetLiveModules(managerType);
+                if (modules == null) continue;
+
+                foreach (var module in modules)
+                {
+                    if (module == null || module.GetType().Name != "BetterGlamourManagement") continue;
+                    method.Invoke(module, null);
+                    this.presetStatus = "已请求打开内置「更好的幻化管理」。";
+                    return;
+                }
+            }
+            catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 打开内置幻化管理失败"); }
+        }
+        this.presetStatus = "没找到内置「更好的幻化管理」的运行实例（插件没启用？）。";
     }
 
     // ══════════════════════════════════════════════════════════
