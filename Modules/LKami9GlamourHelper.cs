@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -2039,6 +2040,101 @@ public sealed class LKami9GlamourHelper : ModuleBase
         return items;
     }
 
+    /// <summary>
+    /// 找到内置「更好的幻化管理」模块的**活实例**。
+    ///
+    /// 走的是 KamiToolKit 自己的窗口登记表：`NativeAddon.CreatedAddons`（internal static List&lt;NativeAddon&gt;）。
+    /// 内置的两个界面（BetterGlamourActionsNativeUI / BetterGlamourManagerNativeUI）都在里面，
+    /// 而它们身上的 `Action` 字段是用 `this.TryOnInspect` 这类**实例方法组**构造的 →
+    /// `delegate.Target` 就是内置模块实例本身。
+    ///
+    /// 这样只需要：读 1 个已知类型的静态属性 + 几个已知类型的字段，
+    /// **不再遍历程序集所有类型的静态字段**（那种写法会强制触发一堆类型的静态构造函数，太侵入）。
+    /// </summary>
+    private static object? FindBuiltinGlamourModule()
+    {
+        try
+        {
+            var prop = typeof(KamiToolKit.BaseTypes.NativeAddon).GetProperty(
+                "CreatedAddons", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+            if (prop?.GetValue(null) is not System.Collections.IEnumerable addons) return null;
+
+            foreach (var addon in addons)
+            {
+                if (addon == null) continue;
+                var tn = addon.GetType().Name;
+                if (tn is not ("BetterGlamourActionsNativeUI" or "BetterGlamourManagerNativeUI")) continue;
+
+                foreach (var f in addon.GetType().GetFields(
+                             BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
+                {
+                    if (!typeof(System.Delegate).IsAssignableFrom(f.FieldType)) continue;
+                    object? d;
+                    try { d = f.GetValue(addon); } catch { continue; }
+                    var target = (d as System.Delegate)?.Target;
+                    if (target != null
+                        && target.GetType().FullName == "OmniToolbox.TreePublic.BetterGlamourManagement")
+                        return target;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 定位内置幻化模块失败");
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 把一条预设塞进内置模块正在用的内存配置，并让宿主把它落盘。
+    /// 成功返回 true（此时预设立刻可见，不需要重载插件）。
+    /// </summary>
+    private bool TryAddToLiveBuiltin(
+        string name, List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems, out string how)
+    {
+        how = "";
+        var module = FindBuiltinGlamourModule();
+        if (module == null) return false;
+
+        var mt = module.GetType();
+        const BindingFlags inst = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+
+        if (mt.GetField("config", inst)?.GetValue(module) is not OmniToolbox.TreePublic.BetterGlamourManagementConfig cfg)
+            return false;
+
+        var preset = new OmniToolbox.TreePublic.BetterGlamourPreset { Name = name, GearsetIndex = -1 };
+        foreach (var (slot, itemId, s0, s1) in slotItems)
+            preset.Items.Add(new OmniToolbox.TreePublic.BetterGlamourItem
+            {
+                Slot = slot, ItemID = itemId, Stain0 = s0, Stain1 = s1,
+            });
+
+        cfg.Presets.Add(preset);
+
+        // 让宿主把配置写盘（这样文件里也有了）
+        var saved = false;
+        try
+        {
+            if (mt.GetField("saveConfig", inst)?.GetValue(module) is System.Action save)
+            {
+                save();
+                saved = true;
+            }
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 调用宿主保存失败（内存已生效）"); }
+
+        // 管理界面若已建好，把列表推过去 —— 开着的时候也能立刻看到
+        try
+        {
+            var ui = mt.GetField("managerNativeUI", inst)?.GetValue(module);
+            ui?.GetType().GetMethod("UpdateData", inst)?.Invoke(ui, [cfg.Presets, 0]);
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 刷新管理界面失败（不影响数据）"); }
+
+        how = saved ? "内置模块内存 + 已落盘" : "内置模块内存";
+        return true;
+    }
+
     /// <summary>把识别结果追加成一条预设，写进内置幻化管理的配置文件。</summary>
     private void ImportToOmniGlamour()
     {
@@ -2052,14 +2148,38 @@ public sealed class LKami9GlamourHelper : ModuleBase
             ? $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}"
             : this.presetName.Trim();
 
-        var detail = new List<string>();
-        var items = BuildOmniItems(detail);
-        if (items.Count == 0)
+        var slotItems = this.BuildSlotItems();
+        if (slotItems.Count == 0)
         {
             this.presetStatus = "识别结果里没有可写入的槽位（副手无对应槽位，已跳过）。";
             return;
         }
 
+        var detail = new List<string>();
+        foreach (var (slot, _, _, _) in slotItems) detail.Add($"{SlotLabel(slot)}→{slot}");
+        var detailText = string.Join("、", detail);
+
+        // ① 首选：塞进内置模块的活配置（立刻可见 + 让宿主自己落盘）
+        try
+        {
+            if (this.TryAddToLiveBuiltin(name, slotItems, out var liveHow))
+            {
+                this.presetStatus =
+                    $"已存进内置「更好的幻化管理」：{name} / {slotItems.Count} 件（{detailText}）。" +
+                    $"来源：{liveHow}。\n点右边「打开幻化管理」就能看到；也可以直接点「试穿这套」本地试穿。";
+                DalamudServices.PluginLog.Information(
+                    $"[幻化助手] 已存进内置幻化管理：{name} / {slotItems.Count} 件 / 映射 {detailText} / {liveHow}");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写内置内存失败，转写配置文件");
+        }
+
+        // ② 兜底：写配置文件（宿主只在启动时读 → 需要重载）
+        var detail2 = new List<string>();
+        var items = BuildOmniItems(detail2);
         var path = OmniGlamourConfigPath();
         try
         {
@@ -2132,13 +2252,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
                 }
 
                 this.presetStatus =
-                    $"已写入「{name}」：{items.Count} 件（{string.Join("、", detail)}）。" +
+                    $"已写入配置文件「{name}」：{items.Count} 件（{string.Join("、", detail2)}）。" +
                     $"现共 {countBefore + 1} 条预设" + (sameName > 0 ? $"（同名原本已有 {sameName} 条）" : "") + "。\n" +
-                    "新预设要等内置功能重新读取配置：在 Dalamud 插件列表里把 OmniToolbox 禁用再启用（或重启游戏），" +
-                    "然后打开「更好的幻化管理」即可看到并试穿。注意重载会清空本模块当前的识别结果。";
+                    "⚠ 没找到内置模块的活实例，只能写文件：宿主只在启动时读它 → 请把 OmniToolbox 禁用再启用" +
+                    "（或重启游戏）才会看到；重载会清空本模块当前的识别结果。";
 
                 DalamudServices.PluginLog.Information(
-                    $"[幻化助手] 已写入幻化预设：{name} / {items.Count} 件 / 映射 {string.Join("、", detail)} / 文件 {path}");
+                    $"[幻化助手] 已写入幻化预设配置文件：{name} / {items.Count} 件 / 映射 {string.Join("、", detail2)} / 文件 {path}");
             }
         }
         catch (Exception ex)
@@ -2189,9 +2309,9 @@ public sealed class LKami9GlamourHelper : ModuleBase
         {
             if (ImGui.Button("存进内置列表")) ImportToOmniGlamour();
             if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("把识别结果追加成一条预设写进内置「更好的幻化管理」的配置文件\n" +
-                                 "⚠ 内置功能只在启动时读这个文件：写完要立刻把 OmniToolbox 禁用再启用，\n" +
-                                 "且在重载之前别在内置界面里点保存（它会拿内存里的旧列表覆盖掉）");
+                ImGui.SetTooltip("把识别结果追加成一条预设，存进内置「更好的幻化管理」的预设列表\n" +
+                                 "存完点「打开幻化管理」即可看到并试穿\n" +
+                                 "（直接写进内置模块正在用的配置，不需要重载插件）");
         }
 
         if (noResult)
