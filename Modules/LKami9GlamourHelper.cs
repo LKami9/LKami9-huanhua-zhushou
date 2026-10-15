@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -38,7 +37,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     public override ModuleInfo Info { get; } = new()
     {
         Title       = "LKami9幻化助手",
-        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别装备与染剂，显示是否持有、获取方式与可交易性；支持手动斧正；把识别结果写入游戏幻化模板（含自动染色）并应用；可本地试穿（不需要投影台、不需要持有装备）；也可存进内置「更好的幻化管理」的预设列表。",
+        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别装备与染剂，显示是否持有、获取方式与可交易性；支持手动修改；把识别结果写入游戏幻化模板（含自动染色）并应用；可本地试穿（不需要投影台、不需要持有装备）。",
         Category    = ModuleCategory.Item,
         Author      = "LKami9",
         Commands    = [new("用上次的图重新识别", "/omni LKami9GlamourHelper scan")],
@@ -57,7 +56,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private bool busy;
     private int editingIndex = -1;
 
-    // 斧正编辑缓冲（ImGui.InputText 需要 ref 变量，属性不能传 ref；反正一次只编辑一行）
+    // 修改编辑缓冲（ImGui.InputText 需要 ref 变量，属性不能传 ref；反正一次只编辑一行）
     private string editName = "";
     private string editDye1 = "";
     private string editDye2 = "";
@@ -67,13 +66,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private bool pathInit;
 
     // ── 本地试穿 / 导入幻化管理 ──
-    private string presetName = "";
-    private bool presetNameInit;
-    private string presetStatus = "";
-
-    /// <summary>等着写进内置列表的预设（先让内置把窗口开起来，下一帧再注入 —— 见 TickPendingBuiltinImport）。</summary>
-    private (string Name, List<(int Slot, uint ItemId, byte S0, byte S1)> Items)? pendingBuiltinImport;
-    private int pendingImportFrames;
+    // ── 本地试穿 ──
+    private string tryOnStatus = "";
 
     private OmniToolbox.Items.ItemPreviewService? previewService;   // 懒建：第一次试穿时才 new
     private readonly List<(int Slot, uint ItemId, byte S0, byte S1)> tryOnItems = [];
@@ -87,7 +81,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     // ── 文字颜色：一律跟随 Omni 主题（不再单独配置）──
     //    取 OmniTheme.Tokens，切换主题/明暗时本模块会跟着变。
 
-    /// <summary>警示色（模糊匹配问号、斧正提示）—— Omni 主题 Warning。</summary>
+    /// <summary>警示色（模糊匹配问号、修改提示）—— Omni 主题 Warning。</summary>
     private System.Numerics.Vector4 WarnVec => OmniTheme.Tokens.Warning;
 
     /// <summary>错误色（OCR 失败、路径无效等）—— Omni 主题 Error。</summary>
@@ -178,7 +172,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.Separator();
         DrawResultSection();
         DrawPlateSection();
-        DrawOmniPresetSection();
+        DrawTryOnSection();
         return false;
     }
 
@@ -262,7 +256,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         if (needFix > 0)
         {
             ImGui.SameLine();
-            ImGui.TextColored(warn, $"? {needFix} 处模糊匹配 —— 点行尾「改」可粘贴正确名称斧正");
+            ImGui.TextColored(warn, $"? {needFix} 处模糊匹配 —— 点行尾「改」可粘贴正确名称修改");
         }
 
         if (!ImGui.BeginTable("###glamourTable", 7,
@@ -295,7 +289,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
             ImGui.SameLine();
             ImGui.TextUnformatted(r.Name);
             if (r.NeedsReview && ImGui.IsItemHovered())
-                ImGui.SetTooltip($"OCR 识别不确定（匹配分 {r.MatchScore}）\n点行尾「改」粘贴正确名称即可斧正");
+                ImGui.SetTooltip($"OCR 识别不确定（匹配分 {r.MatchScore}）\n点行尾「改」粘贴正确名称即可修改");
             if (r.MatchScore is < 100 and > 0)
             {
                 ImGui.SameLine();
@@ -413,7 +407,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
                 this.editingIndex = this.editingIndex == i ? -1 : i;
                 if (this.editingIndex == i) PrepareEditor(r);
             }
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("斧正这一行（粘贴正确的装备/染剂名）");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("修改这一行（粘贴正确的装备/染剂名）");
         }
 
         ImGui.EndTable();
@@ -422,7 +416,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         DrawUnknownSection(warn);
     }
 
-    // ── 斧正面板（一次编辑一行）──
+    // ── 修改面板（一次编辑一行）──
     private void PrepareEditor(SlotResult r)
     {
         this.editName = r.Name;
@@ -438,7 +432,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         var r = this.results[this.editingIndex];
 
         ImGui.Separator();
-        ImGui.TextColored(warn, $"改 斧正「{r.Slot}」");
+        ImGui.TextColored(warn, $"改 修改「{r.Slot}」");
         ImGui.SameLine();
         if (ImGui.SmallButton("关闭")) { this.editingIndex = -1; return; }
 
@@ -590,7 +584,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         this.editingIndex = -1;
     }
 
-    // ── 手动斧正的解析（比 OCR 匹配宽松：这是玩家明确意图）──
+    // ── 手动修改的解析（比 OCR 匹配宽松：这是玩家明确意图）──
     private (uint Id, uint Icon, string Name, string Slot)? ResolveItem(string input, List<string> candidates)
     {
         BuildIndexIfNeeded();
@@ -719,7 +713,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
             this.statusIsError = false;
             this.status = parsed.Count > 0
                 ? $"识别完成：{parsed.Count} 件装备" +
-                  (needFix > 0 ? $"，其中 {needFix} 件是模糊匹配（打 ?，可点「改」斧正）" : "，全部精确匹配") +
+                  (needFix > 0 ? $"，其中 {needFix} 件是模糊匹配（打 ?，可点「改」修改）" : "，全部精确匹配") +
                   (unknownN > 0 && this.config.ShowUnknowns ? $"，另有 {unknownN} 段未识别文本可手动指派" : "")
                 : "识别完成，但没找到任何装备名 —— 请确认截图里包含装备清单（带装备名的那块）。";
             this.lastTiming = $"(OCR {ocrMs} ms / 匹配 {sw.ElapsedMilliseconds - ocrMs} ms)";
@@ -1950,7 +1944,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     }
 
     // ══════════════════════════════════════════════════════════
-    //  ④ 本地试穿 / 导入内置「更好的幻化管理」
+    //  ④ 本地试穿（不需要投影台、不需要持有装备）
     //
     //    ★ 槽位号用的是**内置「Parts」/ 角色查看窗口的槽位号**，不是游戏幻化模板槽位号！
     //      0 武器  1 副手  2 头部  3 身体  4 手部  5 (空)  6 腿部  7 脚部
@@ -1962,20 +1956,14 @@ public sealed class LKami9GlamourHelper : ModuleBase
     //        ② 玩家自己存的预设 + Item 表逐条核对：
     //             16622 头花→2 / 50268 礼裙→3 / 32326 套袖→4 / 50264 短裙→6 / 14976 礼鞋→7
     //             9293 耳环→8 / 9292 项链→9 / 9294 手镯→10 / 9295 戒指→11、12
-    //        两条完全吻合 → 以此为准。**之前按"游戏幻化模板槽位号"写是错的（腿以下整体差一格）**。
+    //        两条完全吻合 → 以此为准。（早先按"游戏幻化模板槽位号"写是错的，腿以下整体差一格。）
     //
     //    试穿走 OmniToolbox.Items.ItemPreviewService（OmniToolbox.Common 的公开类）：
     //      自己 new 一个实例 + 每帧 Tick + PreviewEquipment(itemId, slot, stain0, stain1)
     //      → 立刻在自己身上生效，不需要投影台、不需要持有装备、不需要重载插件。
-    //    导入内置列表 = 追加一条预设到 TreeHouse\BetterGlamourManagement.json（次要手段：
-    //      宿主只在启动时读这个文件，而且它保存时会把内存里的整份写回去 → 必须写完立刻重载）。
     // ══════════════════════════════════════════════════════════
 
-    private static string OmniGlamourConfigPath() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "XIVLauncherCN", "pluginConfigs", "OmniToolbox", "TreeHouse", "BetterGlamourManagement.json");
-
-    /// <summary>识别槽位名 → 预设槽位号（0~12，见上面注释；无对应返回 -1，例如副手）。</summary>
+    /// <summary>识别槽位名 → 槽位号（0~12，见上面注释；无对应返回 -1，例如副手）。</summary>
     private static int OmniSlotOf(string slot) => slot switch
     {
         "主手" => 0,
@@ -1994,14 +1982,6 @@ public sealed class LKami9GlamourHelper : ModuleBase
         if (dyes.Count > 1 && dyes[1].Id < 256) s1 = (byte)dyes[1].Id;
         return (s0, s1);
     }
-
-    /// <summary>部位显示名（与内置「更好的幻化管理」自身的叫法一致）。</summary>
-    private static string SlotLabel(int slot) => slot switch
-    {
-        0 => "武器", 2 => "头部", 3 => "身体", 4 => "手部", 6 => "腿部", 7 => "脚部",
-        8 => "耳饰", 9 => "项链", 10 => "手镯", 11 => "右戒指", 12 => "左戒指",
-        _ => "槽" + slot,
-    };
 
     /// <summary>识别结果 → 槽位条目（同槽位去重；第二枚戒指落到 12 号槽）。</summary>
     private List<(int Slot, uint ItemId, byte S0, byte S1)> BuildSlotItems()
@@ -2029,317 +2009,12 @@ public sealed class LKami9GlamourHelper : ModuleBase
         return items;
     }
 
-    /// <summary>识别结果 → 预设条目（JSON 形态）。</summary>
-    private static List<Dictionary<string, object?>> ToJsonItems(
-        List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems, List<string> detail)
-    {
-        var items = new List<Dictionary<string, object?>>();
-        foreach (var (slot, itemId, s0, s1) in slotItems)
-        {
-            items.Add(new Dictionary<string, object?>
-            {
-                ["Slot"] = slot, ["ItemID"] = itemId, ["Stain0"] = s0, ["Stain1"] = s1,
-            });
-            detail.Add($"{SlotLabel(slot)}→{slot}");
-        }
-        return items;
-    }
-
-    /// <summary>
-    /// 找到内置「更好的幻化管理」模块的**活实例**。
-    ///
-    /// 走的是 KamiToolKit 自己的窗口登记表：`NativeAddon.CreatedAddons`（internal static List&lt;NativeAddon&gt;）。
-    /// 内置的两个界面（BetterGlamourActionsNativeUI / BetterGlamourManagerNativeUI）都在里面，
-    /// 而它们身上的 `Action` 字段是用 `this.TryOnInspect` 这类**实例方法组**构造的 →
-    /// `delegate.Target` 就是内置模块实例本身。
-    ///
-    /// 这样只需要：读 1 个已知类型的静态属性 + 几个已知类型的字段，
-    /// **不再遍历程序集所有类型的静态字段**（那种写法会强制触发一堆类型的静态构造函数，太侵入）。
-    /// </summary>
-    private static object? FindBuiltinGlamourModule()
-    {
-        try
-        {
-            var prop = typeof(KamiToolKit.BaseTypes.NativeAddon).GetProperty(
-                "CreatedAddons", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
-            if (prop?.GetValue(null) is not System.Collections.IEnumerable addons) return null;
-
-            foreach (var addon in addons)
-            {
-                if (addon == null) continue;
-                var tn = addon.GetType().Name;
-                if (tn is not ("BetterGlamourActionsNativeUI" or "BetterGlamourManagerNativeUI")) continue;
-
-                foreach (var f in addon.GetType().GetFields(
-                             BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
-                {
-                    if (!typeof(System.Delegate).IsAssignableFrom(f.FieldType)) continue;
-                    object? d;
-                    try { d = f.GetValue(addon); } catch { continue; }
-                    var target = (d as System.Delegate)?.Target;
-                    if (target != null
-                        && target.GetType().FullName == "OmniToolbox.TreePublic.BetterGlamourManagement")
-                        return target;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            DalamudServices.PluginLog.Information(ex, "[幻化助手] 定位内置幻化模块失败");
-        }
-        return null;
-    }
-
-    /// <summary>
-    /// 把一条预设塞进内置模块正在用的内存配置，并让宿主把它落盘。
-    /// 成功返回 true（此时预设立刻可见，不需要重载插件）。
-    /// </summary>
-    private bool TryAddToLiveBuiltin(
-        string name, List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems, out string how)
-    {
-        how = "";
-        var module = FindBuiltinGlamourModule();
-        if (module == null) return false;
-
-        var mt = module.GetType();
-        const BindingFlags inst = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
-
-        if (mt.GetField("config", inst)?.GetValue(module) is not OmniToolbox.TreePublic.BetterGlamourManagementConfig cfg)
-            return false;
-
-        var preset = new OmniToolbox.TreePublic.BetterGlamourPreset { Name = name, GearsetIndex = -1 };
-        foreach (var (slot, itemId, s0, s1) in slotItems)
-            preset.Items.Add(new OmniToolbox.TreePublic.BetterGlamourItem
-            {
-                Slot = slot, ItemID = itemId, Stain0 = s0, Stain1 = s1,
-            });
-
-        cfg.Presets.Add(preset);
-
-        // 让宿主把配置写盘（这样文件里也有了）
-        var saved = false;
-        try
-        {
-            if (mt.GetField("saveConfig", inst)?.GetValue(module) is System.Action save)
-            {
-                save();
-                saved = true;
-            }
-        }
-        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 调用宿主保存失败（内存已生效）"); }
-
-        // 管理界面若已建好，把列表推过去 —— 开着的时候也能立刻看到
-        try
-        {
-            var ui = mt.GetField("managerNativeUI", inst)?.GetValue(module);
-            ui?.GetType().GetMethod("UpdateData", inst)?.Invoke(ui, [cfg.Presets, 0]);
-        }
-        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 刷新管理界面失败（不影响数据）"); }
-
-        how = saved ? "内置模块内存 + 已落盘" : "内置模块内存";
-        return true;
-    }
-
-    /// <summary>把识别结果追加成一条预设，写进内置幻化管理的配置文件。</summary>
-    private void ImportToOmniGlamour()
-    {
-        if (this.results.Count == 0)
-        {
-            this.presetStatus = "还没有识别结果，先识别一张图。";
-            return;
-        }
-
-        var name = string.IsNullOrWhiteSpace(this.presetName)
-            ? $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}"
-            : this.presetName.Trim();
-
-        var slotItems = this.BuildSlotItems();
-        if (slotItems.Count == 0)
-        {
-            this.presetStatus = "识别结果里没有可写入的槽位（副手无对应槽位，已跳过）。";
-            return;
-        }
-
-        if (this.pendingBuiltinImport != null)
-        {
-            this.presetStatus = "上一条还在写入内置列表，稍等一下再点。";
-            return;
-        }
-
-        var detail = new List<string>();
-        foreach (var (slot, _, _, _) in slotItems) detail.Add($"{SlotLabel(slot)}→{slot}");
-        var detailText = string.Join("、", detail);
-
-        // ① 内置管理界面已经开着 → 直接塞进它的活配置，立刻可见
-        try
-        {
-            if (this.TryAddToLiveBuiltin(name, slotItems, out var liveHow))
-            {
-                SetBuiltinOkStatus(name, slotItems, liveHow);
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写内置内存失败（稍后会重试）");
-        }
-
-        // ② 界面还没开过 → 让内置自己把窗口开起来（游戏创建原生窗口时会把它登记进 CreatedAddons），
-        //    然后由 TickPendingBuiltinImport 在接下来几帧里重试注入
-        this.pendingBuiltinImport = (name, slotItems);
-        this.pendingImportFrames = 0;
-        try { DalamudServices.CommandManager.ProcessCommand("/omni 幻化管理"); }
-        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 发送打开命令失败"); }
-        this.presetStatus = "正在打开内置「更好的幻化管理」并把预设写进去…";
-    }
-
-    /// <summary>每帧检查有没有等着注入的预设（等内置窗口创建完成后再注入）。</summary>
-    private void TickPendingBuiltinImport()
-    {
-        if (this.pendingBuiltinImport is not { } pending) return;
-
-        this.pendingImportFrames++;
-        if (this.pendingImportFrames < 3) return;          // 给游戏两帧去创建原生窗口
-
-        try
-        {
-            if (this.TryAddToLiveBuiltin(pending.Name, pending.Items, out var how))
-            {
-                this.pendingBuiltinImport = null;
-                SetBuiltinOkStatus(pending.Name, pending.Items, how);
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            DalamudServices.PluginLog.Information(ex, "[幻化助手] 注入内置配置失败（继续重试）");
-        }
-
-        if (this.pendingImportFrames >= 150)                // ≈2.5 秒还不行 → 退回写文件
-        {
-            this.pendingBuiltinImport = null;
-            DalamudServices.PluginLog.Information("[幻化助手] 拿不到内置模块活实例，退回写配置文件");
-            this.TryWritePresetFile(pending.Name, pending.Items);
-        }
-    }
-
-    private void SetBuiltinOkStatus(string name, List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems, string how)
-    {
-        var labels = new List<string>();
-        foreach (var (slot, _, _, _) in slotItems) labels.Add($"{SlotLabel(slot)}→{slot}");
-
-        this.presetStatus =
-            $"已存进内置「更好的幻化管理」：{name} / {slotItems.Count} 件（{string.Join("、", labels)}）。" +
-            $"来源：{how}。\n直接点「打开幻化管理」就能看到并试穿。";
-        DalamudServices.PluginLog.Information(
-            $"[幻化助手] 已存进内置幻化管理：{name} / {slotItems.Count} 件 / 映射 {string.Join("、", labels)} / {how}");
-    }
-
-    /// <summary>兜底：把预设写进内置的配置文件（宿主只在启动时读 → 需要重载 OmniToolbox 才会出现）。</summary>
-    private void TryWritePresetFile(string name, List<(int Slot, uint ItemId, byte S0, byte S1)> slotItems)
-    {
-        var detail2 = new List<string>();
-        var items = ToJsonItems(slotItems, detail2);
-        var path = OmniGlamourConfigPath();
-        try
-        {
-            var preset = new Dictionary<string, object?>
-            {
-                ["Name"] = name,
-                ["GearsetIndex"] = -1,
-                ["GlassesID"] = 0,
-                ["HairstyleID"] = 0,
-                ["Items"] = items,
-            };
-
-            // 读原文件（保留其它键与已有预设的原始写法，只往后追加一条）
-            JsonDocument doc;
-            if (File.Exists(path))
-                doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
-            else
-                doc = JsonDocument.Parse("{\"Enabled\": true, \"Config\": {\"Presets\": []}}");
-            using (doc)
-            {
-                var root = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(doc.RootElement.GetRawText()) ?? [];
-                var cfg = root.TryGetValue("Config", out var cfgEl) && cfgEl.ValueKind == JsonValueKind.Object
-                    ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(cfgEl.GetRawText()) ?? []
-                    : [];
-
-                var presets = new List<object>();
-                var sameName = 0;
-                if (cfg.TryGetValue("Presets", out var pr) && pr.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var p in pr.EnumerateArray())
-                    {
-                        if (p.ValueKind == JsonValueKind.Object
-                            && p.TryGetProperty("Name", out var n) && n.GetString() == name)
-                            sameName++;
-                        presets.Add(p.GetRawText());     // 原样保留
-                    }
-                }
-                var countBefore = presets.Count;
-                presets.Add(preset);
-
-                var tokens = presets
-                    .Select(p => p is string raw
-                        ? JsonDocument.Parse(raw).RootElement.Clone()
-                        : JsonSerializer.SerializeToElement(p))
-                    .ToList();
-
-                var output = new Dictionary<string, object?>
-                {
-                    ["Enabled"] = !root.TryGetValue("Enabled", out var en) || en.ValueKind != JsonValueKind.False,
-                    ["Config"] = new Dictionary<string, object?> { ["Presets"] = tokens },
-                };
-
-                var json = JsonSerializer.Serialize(output, new JsonSerializerOptions
-                {
-                    WriteIndented = true,
-                    // 默认会把中文转成 \uXXXX —— 这文件是给人看的，保留原文
-                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-                });
-
-                if (File.Exists(path))
-                {
-                    try { File.Copy(path, path + ".bak", true); }
-                    catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 预设配置备份失败（继续写）"); }
-                }
-
-                for (var attempt = 1; ; attempt++)
-                {
-                    try { File.WriteAllText(path, json, new UTF8Encoding(false)); break; }
-                    catch (IOException) when (attempt < 5) { System.Threading.Thread.Sleep(150); }
-                }
-
-                this.presetStatus =
-                    $"已写入配置文件「{name}」：{items.Count} 件（{string.Join("、", detail2)}）。" +
-                    $"现共 {countBefore + 1} 条预设" + (sameName > 0 ? $"（同名原本已有 {sameName} 条）" : "") + "。\n" +
-                    "⚠ 没找到内置模块的活实例，只能写文件：宿主只在启动时读它 → 请把 OmniToolbox 禁用再启用" +
-                    "（或重启游戏）才会看到；重载会清空本模块当前的识别结果。";
-
-                DalamudServices.PluginLog.Information(
-                    $"[幻化助手] 已写入幻化预设配置文件：{name} / {items.Count} 件 / 映射 {string.Join("、", detail2)} / 文件 {path}");
-            }
-        }
-        catch (Exception ex)
-        {
-            DalamudServices.PluginLog.Information(ex, "[幻化助手] 写幻化预设失败");
-            this.presetStatus = "写入失败：" + ex.Message;
-        }
-    }
-
-    private void DrawOmniPresetSection()
+    private void DrawTryOnSection()
     {
         ImGui.Spacing();
-        ImGui.TextUnformatted("④ 本地试穿 / 导入幻化管理");
+        ImGui.TextUnformatted("④ 本地试穿");
         ImGui.SameLine();
         ImGui.TextDisabled("（不需要投影台、不需要持有装备）");
-
-        if (!this.presetNameInit)
-        {
-            this.presetName = $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}";
-            this.presetNameInit = true;
-        }
 
         var noResult = this.results.Count == 0;
         using (ImRaii.Disabled(noResult))
@@ -2359,26 +2034,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.SameLine();
         if (ImGui.Button("打开幻化管理"))
             DalamudServices.CommandManager.ProcessCommand("/omni 幻化管理");
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("等价于在聊天框输入 /omni 幻化管理");
-
-        ImGui.Spacing();
-        ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
-        ImGui.InputText("预设名###omniPresetName", ref this.presetName, 64);
-        ImGui.SameLine();
-        using (ImRaii.Disabled(noResult))
-        {
-            if (ImGui.Button("存进内置列表")) ImportToOmniGlamour();
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("把识别结果追加成一条预设，直接存进内置「更好的幻化管理」正在用的配置\n" +
-                                 "如果内置界面还没开过，会自动帮你打开它 —— 打开后就能看到并试穿\n" +
-                                 "（不需要重载插件）");
-        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("打开内置「更好的幻化管理」（等价于在聊天框输入 /omni 幻化管理）");
 
         if (noResult)
-            ImGui.TextDisabled("先识别一张图（② 识别结果里有内容），上面的按钮才会可用。");
+            ImGui.TextDisabled("先识别一张图（② 识别结果里有内容），「试穿这套」才会可用。");
 
-        if (!string.IsNullOrEmpty(this.presetStatus))
-            ImGui.TextWrapped(this.presetStatus);
+        if (!string.IsNullOrEmpty(this.tryOnStatus))
+            ImGui.TextWrapped(this.tryOnStatus);
     }
 
     // ── 本地试穿：用内置同款的 ItemPreviewService（公开 API）────────────────
@@ -2389,7 +2051,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         var items = this.BuildSlotItems();
         if (items.Count == 0)
         {
-            this.presetStatus = "没有可试穿的部位（副手不参与试穿）。";
+            this.tryOnStatus = "没有可试穿的部位（副手不参与试穿）。";
             return;
         }
 
@@ -2400,7 +2062,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         catch (Exception ex)
         {
             DalamudServices.PluginLog.Information(ex, "[幻化助手] 创建试穿服务失败");
-            this.presetStatus = "试穿服务不可用（看 /xllog）。";
+            this.tryOnStatus = "试穿服务不可用（看 /xllog）。";
             return;
         }
 
@@ -2411,7 +2073,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         this.tryOnRetry = 0;
         this.tryOnHeadDone = false;
         this.tryOnActive = true;
-        this.presetStatus = $"正在试穿 {items.Count} 件…";
+        this.tryOnStatus = $"正在试穿 {items.Count} 件…";
     }
 
     /// <summary>停止试穿并恢复原样。</summary>
@@ -2429,7 +2091,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         try
         {
             this.previewService?.ClearPreviewResidue();
-            if (wasActive) this.presetStatus = "已取消试穿。";
+            if (wasActive) this.tryOnStatus = "已取消试穿。";
         }
         catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 取消试穿失败"); }
     }
@@ -2441,9 +2103,6 @@ public sealed class LKami9GlamourHelper : ModuleBase
     /// </summary>
     private void OnFrameworkTick(Dalamud.Plugin.Services.IFramework framework)
     {
-        // 等着注入内置列表的预设：跟试穿无关，先处理（没建过试穿服务时也要跑）
-        this.TickPendingBuiltinImport();
-
         var svc = this.previewService;
         if (svc == null) return;
 
@@ -2489,7 +2148,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
                 this.tryOnHeadDone = true;
 
                 var n = this.tryOnItems.Count - this.tryOnSkipped.Count;
-                this.presetStatus = $"试穿中（{n} 件）。只改本地显示；点「取消试穿」可还原。";
+                this.tryOnStatus = $"试穿中（{n} 件）。只改本地显示；点「取消试穿」可还原。";
                 DalamudServices.PluginLog.Information($"[幻化助手] 试穿已应用：{n} 件");
             }
         }
@@ -2933,7 +2592,7 @@ public sealed class SlotResult
     public string Name { get; set; } = "";
     public int MatchScore { get; set; }
 
-    /// <summary>低于 100 分（模糊匹配）时置位 —— UI 上打问号提示玩家斧正。</summary>
+    /// <summary>低于 100 分（模糊匹配）时置位 —— UI 上打问号提示玩家修改。</summary>
     public bool NeedsReview { get; set; }
 
     public List<DyeResult> Dyes { get; set; } = [];
