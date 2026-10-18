@@ -31,6 +31,7 @@ using OmniToolbox.Common.Module.Abstractions;
 using OmniToolbox.Common.Module.Enums;
 using OmniToolbox.Common.Module.Models;
 using OmniToolbox.Host;
+using OmniToolbox.UI;
 using OmniToolbox.UI.Controls;
 using OmniToolbox.UI.Theme;
 
@@ -96,6 +97,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private bool frameworkHooked;
     private bool standaloneUiHooked;
     private bool mainWindowOpen;
+    private bool mainWindowCollapsed;
+    private System.Numerics.Vector2 mainWindowExpandedSize;
 
     // ── Omni 幻化管理整合 ──
     private int selectedPresetIndex = -1;
@@ -361,15 +364,54 @@ public sealed class LKami9GlamourHelper : ModuleBase
             viewport.WorkSize);
 
         PushOmniWindowStyle();
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, System.Numerics.Vector2.Zero);
         try
         {
             if (ImGui.Begin(
-                    "LKami9 幻化助手###LKami9GlamourMainWindow",
+                    "###LKami9GlamourMainWindow",
                     ref open,
-                    ImGuiWindowFlags.NoCollapse))
+                    ImGuiWindowFlags.NoTitleBar |
+                    ImGuiWindowFlags.NoCollapse |
+                    ImGuiWindowFlags.NoDocking))
             {
-                OmniControls.DrawPopupBackground();
-                this.DrawAssistantContent();
+                var framePosition = ImGui.GetWindowPos();
+                var frameSize = ImGui.GetWindowSize();
+                var chrome = OmniWindowChrome.Draw(
+                    framePosition,
+                    frameSize,
+                    this.mainWindowCollapsed,
+                    "LKami9 幻化助手",
+                    "###LKami9GlamourMainCollapse",
+                    "###LKami9GlamourMainClose");
+
+                if (chrome.CloseClicked)
+                    open = false;
+
+                if (chrome.ToggleCollapse)
+                {
+                    if (this.mainWindowCollapsed)
+                    {
+                        this.mainWindowCollapsed = false;
+                        ImGui.SetWindowSize(this.mainWindowExpandedSize == System.Numerics.Vector2.Zero
+                            ? initialSize
+                            : this.mainWindowExpandedSize);
+                    }
+                    else
+                    {
+                        this.mainWindowExpandedSize = frameSize;
+                        this.mainWindowCollapsed = true;
+                        ImGui.SetWindowSize(OmniTheme.CollapsedWindowSize(frameSize.X));
+                    }
+                }
+
+                if (!this.mainWindowCollapsed)
+                {
+                    var (contentPosition, contentSize) = OmniWindowChrome.GetContentBounds(framePosition, frameSize);
+                    ImGui.SetCursorScreenPos(contentPosition);
+                    ImGui.PushItemWidth(MathF.Max(1f, contentSize.X));
+                    this.DrawAssistantContent();
+                    ImGui.PopItemWidth();
+                }
             }
 
             this.mainWindowOpen = open;
@@ -377,6 +419,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
         finally
         {
+            ImGui.PopStyleVar();
             PopOmniWindowStyle();
         }
     }
