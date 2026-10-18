@@ -16,7 +16,9 @@ using Dalamud.Interface.Utility.Raii;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
@@ -45,10 +47,14 @@ public sealed class LKami9GlamourHelper : ModuleBase
     public override ModuleInfo Info { get; } = new()
     {
         Title       = "LKami9幻化助手",
-        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别 14 个部位的装备与染剂，显示是否持有、获取方式与可交易性；支持手动修改；可写入游戏幻化模板、应用模板和本地试穿；整合 Omni「更好的幻化管理」的预设保存、角色查看窗口抓取、逐部位编辑、发型/眼镜、分享文本与套装自动试穿。",
+        Description = "独立窗口版幻化助手：识别石之家截图、显示持有与获取方式、写入/应用幻化模板，并整合 Omni「更好的幻化管理」的预设编辑、发型/眼镜、套装自动试穿；角色查看窗口旁提供试穿、保存、复制和打开主窗口快捷栏。",
         Category    = ModuleCategory.Item,
         Author      = "LKami9",
-        Commands    = [new("用上次的图重新识别", "/omni LKami9GlamourHelper scan")],
+        Commands    =
+        [
+            new("打开幻化助手窗口", "/omni LKami9GlamourHelper open"),
+            new("用上次的图重新识别", "/omni LKami9GlamourHelper scan"),
+        ],
     };
 
     public override bool HasSettings => true;
@@ -87,6 +93,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private uint tryOnGlassesId;
     private uint tryOnHairstyleId;
     private bool frameworkHooked;
+    private bool standaloneUiHooked;
+    private bool mainWindowOpen;
 
     // ── Omni 幻化管理整合 ──
     private int selectedPresetIndex = -1;
@@ -157,6 +165,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
             this.frameworkHooked = true;
         }
         catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 注册框架更新失败（试穿不可用）"); }
+
+        try
+        {
+            DalamudServices.PluginInterface.UiBuilder.Draw += this.DrawStandaloneUi;
+            this.standaloneUiHooked = true;
+        }
+        catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[幻化助手] 注册独立窗口失败"); }
     }
 
     protected override void OnDisable()
@@ -168,7 +183,16 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
         catch { }
 
+        try
+        {
+            if (this.standaloneUiHooked)
+                DalamudServices.PluginInterface.UiBuilder.Draw -= this.DrawStandaloneUi;
+            this.standaloneUiHooked = false;
+        }
+        catch { }
+
         this.StopTryOn(clear: true);
+        this.mainWindowOpen = false;
         this.lastGearsetIndex = int.MinValue;
         this.activePresetIndex = -1;
         this.activePresetFromGearset = false;
@@ -194,6 +218,18 @@ public sealed class LKami9GlamourHelper : ModuleBase
     public override bool TryHandleCommand(string arguments)
     {
         var arg = (arguments ?? "").Trim().ToLowerInvariant();
+        if (arg is "open" or "window" or "界面" or "打开")
+        {
+            this.mainWindowOpen = true;
+            return true;
+        }
+
+        if (arg is "close" or "关闭")
+        {
+            this.mainWindowOpen = false;
+            return true;
+        }
+
         if (arg is "scan" or "识别" or "")
         {
             if (!string.IsNullOrWhiteSpace(this.config.LastImagePath) && File.Exists(this.config.LastImagePath))
@@ -211,15 +247,154 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
     public override bool DrawSettings()
     {
-        TickPlateWrite();          // 每帧只处理写入队列里的一件（避免同帧多次调 Agent）
-        TickApplyPlate();          // 应用模板也分帧发指令
+        ImGui.TextUnformatted("LKami9幻化助手");
+        ImGui.TextDisabled("主界面已改为独立窗口，可在游戏里连续缩放、移动和查看。");
+        if (ImGui.Button("打开幻化助手窗口"))
+            this.mainWindowOpen = true;
+
+        ImGui.SameLine();
+        var showInspect = this.config.ShowInspectQuickActions;
+        if (ImGui.Checkbox("角色查看窗口旁显示快捷栏###showInspectQuickActions", ref showInspect))
+            this.config.ShowInspectQuickActions = showInspect;
+
+        ImGui.Spacing();
+        if (this.results.Count > 0)
+            ImGui.TextDisabled($"当前识别结果：{this.results.Count} 件；可用主窗口继续编辑或写入模板。");
+        else
+            ImGui.TextDisabled("还没有识别结果。打开主窗口后可从剪贴板或图片文件识别。");
+        return false;
+    }
+
+    private void DrawAssistantContent()
+    {
         DrawInputSection();
         ImGui.Separator();
         DrawResultSection();
         DrawPlateSection();
         DrawTryOnSection();
         DrawPresetSection();
-        return false;
+    }
+
+    private void DrawStandaloneUi()
+    {
+        try
+        {
+            if (this.mainWindowOpen)
+                this.DrawMainWindow();
+
+            if (this.config.ShowInspectQuickActions)
+                this.DrawInspectQuickActions();
+        }
+        catch (Exception ex)
+        {
+            DalamudServices.PluginLog.Warning(ex, "[幻化助手] 独立窗口绘制失败");
+        }
+    }
+
+    private void DrawMainWindow()
+    {
+        var open = this.mainWindowOpen;
+        ImGui.SetNextWindowSize(
+            new System.Numerics.Vector2(1100 * ImGuiHelpers.GlobalScale, 760 * ImGuiHelpers.GlobalScale),
+            ImGuiCond.FirstUseEver);
+
+        if (ImGui.Begin(
+                "LKami9 幻化助手###LKami9GlamourMainWindow",
+                ref open,
+                ImGuiWindowFlags.NoCollapse))
+        {
+            this.DrawAssistantContent();
+        }
+
+        this.mainWindowOpen = open;
+        ImGui.End();
+    }
+
+    private unsafe void DrawInspectQuickActions()
+    {
+        if (!DalamudServices.PlayerState.IsLoaded)
+            return;
+
+        var manager = RaptureAtkUnitManager.Instance();
+        var addon = manager != null ? manager->GetAddonByName("CharacterInspect") : null;
+        if (addon == null ||
+            !addon->IsAddonAndNodesReady() ||
+            addon->WindowNode == null ||
+            !addon->IsVisible)
+            return;
+
+        var inspectState = addon->WindowNode->GetNodeState();
+        var viewport = ImGui.GetMainViewport();
+        var min = viewport.WorkPos + new System.Numerics.Vector2(8f);
+        var max = viewport.WorkPos + viewport.WorkSize - new System.Numerics.Vector2(300f, 240f);
+        var target = new System.Numerics.Vector2(
+            inspectState.TopLeft.X + inspectState.Width + 6f,
+            inspectState.TopLeft.Y);
+        var position = System.Numerics.Vector2.Clamp(target, min, System.Numerics.Vector2.Max(min, max));
+
+        ImGui.SetNextWindowPos(position, ImGuiCond.Always);
+        var show = this.config.ShowInspectQuickActions;
+        if (ImGui.Begin(
+                "LKami9幻化助手###LKami9GlamourInspectActions",
+                ref show,
+                ImGuiWindowFlags.AlwaysAutoResize |
+                ImGuiWindowFlags.NoResize |
+                ImGuiWindowFlags.NoCollapse |
+                ImGuiWindowFlags.NoDocking))
+        {
+            ImGui.TextDisabled("当前角色查看");
+            if (ImGui.Button("试穿该角色"))
+                this.TryOnInspectedCharacter();
+            ImGui.SameLine();
+            if (ImGui.Button("保存为预设"))
+                this.AddPresetFromCharacterInspect();
+            ImGui.SameLine();
+            if (ImGui.Button("复制分享文本"))
+                this.CopyInspectedPresetToClipboard();
+
+            if (ImGui.Button("打开完整助手"))
+                this.mainWindowOpen = true;
+            ImGui.SameLine();
+            if (ImGui.Button("清除试穿"))
+                this.StopTryOn(clear: true);
+
+            if (!string.IsNullOrEmpty(this.presetStatus))
+                ImGui.TextWrapped(this.presetStatus);
+        }
+
+        this.config.ShowInspectQuickActions = show;
+        ImGui.End();
+    }
+
+    private unsafe void TryOnInspectedCharacter()
+    {
+        var preset = this.CaptureCharacterInspectPreset();
+        if (preset == null)
+        {
+            this.presetStatus = "没有读到角色查看窗口的数据。";
+            return;
+        }
+
+        this.activePresetIndex = -1;
+        this.activePresetFromGearset = false;
+        this.StartTryOnItems(
+            this.BuildPresetTryOnItems(preset),
+            preset.GlassesID,
+            preset.HairstyleID);
+        this.presetStatus = "已开始试穿角色查看窗口中的幻化。";
+    }
+
+    private void CopyInspectedPresetToClipboard()
+    {
+        var preset = this.CaptureCharacterInspectPreset();
+        if (preset == null)
+        {
+            this.presetStatus = "没有读到角色查看窗口的数据。";
+            return;
+        }
+
+        CopyTextToClipboard(this.BuildPresetText(preset));
+        this.presetStatus = "已复制角色查看窗口的分享文本。";
     }
 
     private void DrawInputSection()
@@ -2282,18 +2457,23 @@ public sealed class LKami9GlamourHelper : ModuleBase
             return;
 
         var preset = this.config.Presets[presetIndex];
-        var items = preset.Items
+
+        this.activePresetIndex = presetIndex;
+        this.activePresetFromGearset = fromGearset;
+        this.StartTryOnItems(
+            this.BuildPresetTryOnItems(preset),
+            preset.GlassesID,
+            preset.HairstyleID);
+    }
+
+    private List<(int Slot, uint ItemId, byte S0, byte S1)> BuildPresetTryOnItems(LKami9GlamourPreset preset) =>
+        preset.Items
             .Where(x => x.ItemID != 0)
             .GroupBy(x => x.Slot)
             .Select(x => x.Last())
             .OrderBy(x => x.Slot)
             .Select(x => (x.Slot, x.ItemID, x.Stain0, x.Stain1))
             .ToList();
-
-        this.activePresetIndex = presetIndex;
-        this.activePresetFromGearset = fromGearset;
-        this.StartTryOnItems(items, preset.GlassesID, preset.HairstyleID);
-    }
 
     private void StartTryOnItems(
         IReadOnlyList<(int Slot, uint ItemId, byte S0, byte S1)> items,
@@ -2363,6 +2543,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     /// </summary>
     private void OnFrameworkTick(Dalamud.Plugin.Services.IFramework framework)
     {
+        this.TickPlateWrite();
+        this.TickApplyPlate();
         this.TickGearsetBinding();
 
         var svc = this.previewService;
@@ -4034,4 +4216,7 @@ public sealed class LKami9GlamourHelperConfig
 
     /// <summary>切换套装时自动试穿绑定的预设。</summary>
     public bool AutoApplyBoundPreset { get; set; } = true;
+
+    /// <summary>在游戏角色查看窗口旁显示快捷操作栏。</summary>
+    public bool ShowInspectQuickActions { get; set; } = true;
 }

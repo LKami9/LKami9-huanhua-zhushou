@@ -23,6 +23,8 @@ https://raw.githubusercontent.com/LKami9/LKami9-huanhua-zhushou/main/TreeHouseMo
 | 写入模板 | 写入游戏内幻化模板并自动染色，支持指定模板号（1~20） |
 | 应用模板 | 投影（穿上）指定模板 |
 | 本地试穿 | 不需要投影台或持有装备；支持装备、染剂、发型和眼镜，自动补回模型重置 |
+| 独立窗口 | 主界面改为可移动、可缩放的独立窗口，不再挤在 Omni 设置页中 |
+| 角色检视快捷栏 | 打开游戏角色查看窗口时，在旁边显示试穿、保存预设、复制分享文本、清除和打开主窗口按钮 |
 | 幻化预设 | 整合 Omni「更好的幻化管理」等价功能：保存识别结果、读取角色查看窗口、导入 Omni 已有预设、逐部位编辑、复制分享文本、删除 |
 | 套装绑定 | 每条预设可绑定一个套装，切换套装时自动开始对应本地试穿 |
 
@@ -43,3 +45,9 @@ https://raw.githubusercontent.com/LKami9/LKami9-huanhua-zhushou/main/TreeHouseMo
 - 打开游戏的角色查看窗口后，可直接读取完整幻化、染剂、发型与眼镜。
 - 可导入 OmniToolbox 的 `BetterGlamourManagement.json` 中已有预设。
 - 预设支持逐部位修改装备与双染剂、绑定套装、复制 Omni 兼容的分享文本。
+
+## 独立窗口
+
+- 在 Omni 模块设置中点击「打开幻化助手窗口」。
+- 或在游戏内执行 `/omni LKami9GlamourHelper open`。
+- 打开任意玩家的角色查看窗口后，助手会在窗口旁显示快捷操作栏。
