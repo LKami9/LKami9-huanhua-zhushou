@@ -14,9 +14,14 @@ using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
+
+using OmenTools.Extensions;
 
 using OmniToolbox.Common.Module.Abstractions;
 using OmniToolbox.Common.Module.Enums;
@@ -38,7 +43,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     public override ModuleInfo Info { get; } = new()
     {
         Title       = "LKami9幻化助手",
-        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别 14 个部位（主手/副手/头部/上衣/手部/腿部/脚部/耳坠/项链/手镯/戒指/面部配饰/时尚配饰）的装备与染剂，显示是否持有、获取方式与可交易性；支持手动修改；把识别结果写入游戏幻化模板（含自动染色）并应用；可本地试穿（不需要投影台、不需要持有装备）。",
+        Description = "粘贴石之家幻化截图（剪贴板或图片文件），识别 14 个部位的装备与染剂，显示是否持有、获取方式与可交易性；支持手动修改；可写入游戏幻化模板、应用模板和本地试穿；整合 Omni「更好的幻化管理」的预设保存、角色查看窗口抓取、逐部位编辑、发型/眼镜、分享文本与套装自动试穿。",
         Category    = ModuleCategory.Item,
         Author      = "LKami9",
         Commands    = [new("用上次的图重新识别", "/omni LKami9GlamourHelper scan")],
@@ -77,7 +82,28 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private int tryOnRetry;          // 同一件连续失败几帧
     private bool tryOnHeadDone;      // 眼镜/发型是否已处理
     private bool tryOnActive;
+    private uint tryOnGlassesId;
+    private uint tryOnHairstyleId;
     private bool frameworkHooked;
+
+    // ── Omni 幻化管理整合 ──
+    private int selectedPresetIndex = -1;
+    private int presetEditSlot = -1;
+    private string presetNameBuffer = "";
+    private string presetItemInput = "";
+    private string presetDye0Input = "";
+    private string presetDye1Input = "";
+    private string presetGlassesInput = "";
+    private string presetHairstyleInput = "";
+    private string presetStatus = "";
+    private readonly List<string> presetItemCandidates = [];
+    private int activePresetIndex = -1;
+    private bool activePresetFromGearset;
+    private int lastGearsetIndex = int.MinValue;
+    private Dictionary<string, uint>? glassesByName;
+    private Dictionary<uint, string>? glassesNameById;
+    private Dictionary<string, uint>? hairstyleByName;
+    private Dictionary<uint, string>? hairstyleNameById;
 
     // ── 文字颜色：一律跟随 Omni 主题（不再单独配置）──
     //    取 OmniTheme.Tokens，切换主题/明暗时本模块会跟着变。
@@ -97,6 +123,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     // ── 数据索引（惰性构建）──
     private Dictionary<string, (uint Id, uint Icon, string Slot, bool Untradable)>? itemByName;
     private Dictionary<string, uint>? stainByName;
+    private Dictionary<uint, string>? stainNameById;
     private List<string>? dyeLex;
 
     private static readonly string[] SpecialLex = ["不可染色", "无染色"];
@@ -112,6 +139,12 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
     protected override void OnEnable()
     {
+        this.config.Presets ??= [];
+        foreach (var preset in this.config.Presets)
+        {
+            preset.Name ??= "";
+            preset.Items ??= [];
+        }
         try { EnsureOcrScript(); }
         catch (Exception ex) { DalamudServices.PluginLog.Error(ex, "[幻化助手] 写出 OCR 脚本失败"); }
 
@@ -134,6 +167,9 @@ public sealed class LKami9GlamourHelper : ModuleBase
         catch { }
 
         this.StopTryOn(clear: true);
+        this.lastGearsetIndex = int.MinValue;
+        this.activePresetIndex = -1;
+        this.activePresetFromGearset = false;
     }
 
     protected override void OnDispose()
@@ -146,6 +182,9 @@ public sealed class LKami9GlamourHelper : ModuleBase
     {
         this.config = new LKami9GlamourHelperConfig();
         this.results.Clear();
+        this.selectedPresetIndex = -1;
+        this.presetEditSlot = -1;
+        this.presetStatus = "";
         this.status = "设置已重置。";
         return true;
     }
@@ -177,6 +216,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         DrawResultSection();
         DrawPlateSection();
         DrawTryOnSection();
+        DrawPresetSection();
         return false;
     }
 
@@ -751,6 +791,20 @@ public sealed class LKami9GlamourHelper : ModuleBase
         BuildIndexIfNeeded();
         var s = StripNoise(input);
         if (s.Length < 2) return null;
+
+        if (uint.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var itemId))
+        {
+            try
+            {
+                var row = DalamudServices.DataManager.GetExcelSheet<Item>().GetRow(itemId);
+                var slot = row.RowId != 0
+                    ? DescribeSlot(row, DalamudServices.DataManager.GetExcelSheet<EquipSlotCategory>())
+                    : null;
+                if (row.RowId != 0 && slot != null)
+                    return (row.RowId, row.Icon, row.Name.ToString(), slot);
+            }
+            catch { }
+        }
 
         if (this.itemByName!.TryGetValue(s, out var exact))
             return (exact.Id, exact.Icon, s, exact.Slot);
@@ -2215,9 +2269,38 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private void StartTryOnFromResults()
     {
         var items = this.BuildSlotItems();
-        if (items.Count == 0)
+        this.activePresetIndex = -1;
+        this.activePresetFromGearset = false;
+        this.StartTryOnItems(items, 0, 0);
+    }
+
+    private void StartTryOnPreset(int presetIndex, bool fromGearset)
+    {
+        if (presetIndex < 0 || presetIndex >= this.config.Presets.Count)
+            return;
+
+        var preset = this.config.Presets[presetIndex];
+        var items = preset.Items
+            .Where(x => x.ItemID != 0)
+            .GroupBy(x => x.Slot)
+            .Select(x => x.Last())
+            .OrderBy(x => x.Slot)
+            .Select(x => (x.Slot, x.ItemID, x.Stain0, x.Stain1))
+            .ToList();
+
+        this.activePresetIndex = presetIndex;
+        this.activePresetFromGearset = fromGearset;
+        this.StartTryOnItems(items, preset.GlassesID, preset.HairstyleID);
+    }
+
+    private void StartTryOnItems(
+        IReadOnlyList<(int Slot, uint ItemId, byte S0, byte S1)> items,
+        uint glassesId,
+        uint hairstyleId)
+    {
+        if (items.Count == 0 && glassesId == 0 && hairstyleId == 0)
         {
-            this.tryOnStatus = "没有可试穿的部位（副手不参与试穿）。";
+            this.tryOnStatus = "没有可试穿的部位。";
             return;
         }
 
@@ -2238,8 +2321,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
         this.tryOnLastIndex = -1;
         this.tryOnRetry = 0;
         this.tryOnHeadDone = false;
+        this.tryOnGlassesId = glassesId;
+        this.tryOnHairstyleId = hairstyleId;
         this.tryOnActive = true;
-        this.tryOnStatus = $"正在试穿 {items.Count} 件…";
+        var sourceName = this.activePresetIndex >= 0 && this.activePresetIndex < this.config.Presets.Count
+            ? DisplayPresetName(this.config.Presets[this.activePresetIndex])
+            : "当前识别结果";
+        this.tryOnStatus = $"正在试穿「{sourceName}」（{items.Count} 件）…";
     }
 
     /// <summary>停止试穿并恢复原样。</summary>
@@ -2252,6 +2340,10 @@ public sealed class LKami9GlamourHelper : ModuleBase
         this.tryOnLastIndex = -1;
         this.tryOnRetry = 0;
         this.tryOnHeadDone = false;
+        this.tryOnGlassesId = 0;
+        this.tryOnHairstyleId = 0;
+        this.activePresetIndex = -1;
+        this.activePresetFromGearset = false;
         if (!clear) return;
 
         try
@@ -2269,6 +2361,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     /// </summary>
     private void OnFrameworkTick(Dalamud.Plugin.Services.IFramework framework)
     {
+        this.TickGearsetBinding();
+
         var svc = this.previewService;
         if (svc == null) return;
 
@@ -2306,11 +2400,31 @@ public sealed class LKami9GlamourHelper : ModuleBase
                 return;
             }
 
-            // ② 全部生效 → 眼镜/发型
+            // ② 全部生效 → 眼镜/发型。游戏换区、换角或重载模型时也会被重置，
+            //    所以这里和 Omni 内置实现一样，每帧校验并补回。
+            if (!svc.IsGlassesPreviewApplied(this.tryOnGlassesId))
+            {
+                svc.PreviewGlasses(this.tryOnGlassesId);
+                this.tryOnHeadDone = false;
+                return;
+            }
+
+            if (this.tryOnHairstyleId != 0)
+            {
+                if (!svc.IsHairstylePreviewApplied(this.tryOnHairstyleId))
+                {
+                    svc.PreviewHairstyle(this.tryOnHairstyleId);
+                    this.tryOnHeadDone = false;
+                    return;
+                }
+            }
+            else if (!this.tryOnHeadDone)
+            {
+                svc.RestoreHairstylePreview();
+            }
+
             if (!this.tryOnHeadDone)
             {
-                svc.PreviewGlasses(0);              // 识别结果里没有眼镜信息 → 先不戴
-                svc.RestoreHairstylePreview();      // 发型也不动
                 this.tryOnHeadDone = true;
 
                 var n = this.tryOnItems.Count - this.tryOnSkipped.Count;
@@ -2557,14 +2671,17 @@ public sealed class LKami9GlamourHelper : ModuleBase
         this.itemByName = map;
 
         var stains = new Dictionary<string, uint>();
+        var stainNames = new Dictionary<uint, string>();
         foreach (var s in DalamudServices.DataManager.GetExcelSheet<Stain>())
         {
             if (s.RowId == 0) continue;
             var n = s.Name.ToString();
             if (string.IsNullOrWhiteSpace(n) || stains.ContainsKey(n)) continue;
             stains[n] = s.RowId;
+            stainNames[s.RowId] = n;
         }
         this.stainByName = stains;
+        this.stainNameById = stainNames;
         this.dyeLex = stains.Keys.Where(k => k.Length >= 2).OrderByDescending(k => k.Length).ToList();
 
         DalamudServices.PluginLog.Information(
@@ -2655,9 +2772,17 @@ public sealed class LKami9GlamourHelper : ModuleBase
         var sb = new StringBuilder(s.Length);
         foreach (var c in s)
         {
-            if (char.IsWhiteSpace(c)) continue;
-            if ("ZØ囗口0O".IndexOf(c) >= 0) continue;
-            sb.Append(c);
+            if (char.IsWhiteSpace(c) || char.IsControl(c))
+                continue;
+
+            // 只归一化明确的正字变体，不能删除「口 / O / 0 / Z」：
+            // 游戏里真实存在「秘银口罩」「熊口战盔」等名称。
+            sb.Append(c switch
+            {
+                'Ø' => 'O',
+                '囗' => '口',
+                _ => c,
+            });
         }
         return sb.ToString();
     }
@@ -2700,6 +2825,989 @@ public sealed class LKami9GlamourHelper : ModuleBase
             Process.Start(new ProcessStartInfo { FileName = dir, UseShellExecute = true });
         }
         catch { }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  ⑤ 幻化预设（整合 Omni「更好的幻化管理」）
+    // ══════════════════════════════════════════════════════════
+
+    private static readonly (int Slot, string Name)[] PresetSlots =
+    [
+        (0, "主手"), (1, "副手"), (2, "头部"), (3, "上衣"), (4, "手部"),
+        (6, "腿部"), (7, "脚部"), (8, "耳坠"), (9, "项链"), (10, "手镯"),
+        (11, "戒指1"), (12, "戒指2"),
+    ];
+
+    private static readonly int[] InspectPresetSlots = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12];
+
+    private void DrawPresetSection()
+    {
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.TextUnformatted("⑤ 幻化预设");
+        ImGui.SameLine();
+        ImGui.TextDisabled("（整合 Omni「更好的幻化管理」：保存、编辑、绑定套装、本地试穿与分享）");
+
+        using (ImRaii.Disabled(this.results.Count == 0))
+        {
+            if (ImGui.Button("当前识别结果存为预设"))
+                this.AddPresetFromResults();
+        }
+        if (ImGui.IsItemHovered() && this.results.Count == 0)
+            ImGui.SetTooltip("先识别一张图，或使用右侧按钮从角色查看窗口读取。");
+
+        ImGui.SameLine();
+        if (ImGui.Button("从角色查看窗口保存"))
+            this.AddPresetFromCharacterInspect();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("先打开游戏的角色查看窗口，再点这里。会读取对方/自己的幻化、染剂、发型和眼镜。");
+
+        ImGui.SameLine();
+        if (ImGui.Button("导入 Omni 已有预设"))
+            this.ImportOmniPresets();
+
+        var autoGearset = this.config.AutoApplyBoundPreset;
+        if (ImGui.Checkbox("切换套装时自动试穿绑定预设###autoGearsetPreset", ref autoGearset))
+            this.config.AutoApplyBoundPreset = autoGearset;
+        if (!this.config.AutoApplyBoundPreset)
+            this.lastGearsetIndex = int.MinValue;
+
+        this.NormalizePresetSelection();
+        if (this.config.Presets.Count == 0)
+        {
+            ImGui.TextDisabled("还没有预设。可从识别结果保存、从角色查看窗口读取，或导入 Omni 幻化管理中的现有预设。");
+            if (!string.IsNullOrEmpty(this.presetStatus))
+                ImGui.TextWrapped(this.presetStatus);
+            return;
+        }
+
+        ImGui.BeginChild(
+            "###presetManagerBody",
+            new System.Numerics.Vector2(0, 430 * ImGuiHelpers.GlobalScale),
+            false);
+        if (ImGui.BeginListBox("###presetList", new System.Numerics.Vector2(250 * ImGuiHelpers.GlobalScale, 118 * ImGuiHelpers.GlobalScale)))
+        {
+            for (var i = 0; i < this.config.Presets.Count; i++)
+            {
+                var preset = this.config.Presets[i];
+                var gearset = preset.GearsetIndex >= 0 ? $" [套装 {preset.GearsetIndex + 1}]" : "";
+                var active = this.activePresetIndex == i ? " [试穿中]" : "";
+                if (!ImGui.Selectable($"{DisplayPresetName(preset)}{gearset}{active}###presetSelect{i}", i == this.selectedPresetIndex))
+                    continue;
+
+                this.SelectPreset(i);
+            }
+
+            ImGui.EndListBox();
+        }
+
+        ImGui.SameLine();
+        ImGui.BeginGroup();
+        if (this.selectedPresetIndex < 0 || this.selectedPresetIndex >= this.config.Presets.Count)
+        {
+            ImGui.EndGroup();
+            ImGui.EndChild();
+            return;
+        }
+
+        var selected = this.config.Presets[this.selectedPresetIndex];
+        ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
+        if (ImGui.InputText("预设名###presetName", ref this.presetNameBuffer, 80))
+            selected.Name = this.presetNameBuffer;
+
+        this.DrawPresetGearsetSelector(selected);
+
+        if (ImGui.Button("试穿 / 应用"))
+            this.StartTryOnPreset(this.selectedPresetIndex, false);
+        ImGui.SameLine();
+        if (ImGui.Button("复制分享文本"))
+            this.CopyPresetText(selected);
+        ImGui.SameLine();
+        if (ImGui.Button("删除预设"))
+            this.DeleteSelectedPreset();
+
+        this.DrawPresetItemTable(selected);
+        this.DrawPresetSpecialRows(selected);
+        ImGui.EndGroup();
+        ImGui.EndChild();
+
+        if (!string.IsNullOrEmpty(this.presetStatus))
+            ImGui.TextWrapped(this.presetStatus);
+    }
+
+    private void NormalizePresetSelection()
+    {
+        if (this.config.Presets.Count == 0)
+        {
+            this.selectedPresetIndex = -1;
+            this.presetEditSlot = -1;
+            return;
+        }
+
+        if (this.selectedPresetIndex < 0 || this.selectedPresetIndex >= this.config.Presets.Count)
+            this.SelectPreset(0);
+    }
+
+    private void SelectPreset(int index)
+    {
+        if (index < 0 || index >= this.config.Presets.Count)
+            return;
+
+        this.selectedPresetIndex = index;
+        this.presetEditSlot = -1;
+        this.presetItemCandidates.Clear();
+        var preset = this.config.Presets[index];
+        this.presetNameBuffer = preset.Name;
+        this.presetGlassesInput = GetGlassesName(preset.GlassesID);
+        this.presetHairstyleInput = GetHairstyleName(preset.HairstyleID);
+    }
+
+    private void AddPresetFromResults()
+    {
+        var preset = new LKami9GlamourPreset
+        {
+            Name = $"幻化 {DateTime.Now:yyyy-MM-dd HH:mm}",
+        };
+
+        foreach (var (slot, itemId, stain0, stain1) in this.BuildPresetItemsFromResults())
+        {
+            preset.Items.Add(new LKami9GlamourPresetItem
+            {
+                Slot = slot,
+                ItemID = itemId,
+                Stain0 = stain0,
+                Stain1 = stain1,
+            });
+        }
+
+        if (preset.Items.Count == 0)
+        {
+            this.presetStatus = "当前识别结果里没有可保存到幻化预设的部位。";
+            return;
+        }
+
+        this.AddPreset(preset, "已把当前识别结果保存为预设。");
+    }
+
+    private List<(int Slot, uint ItemId, byte Stain0, byte Stain1)> BuildPresetItemsFromResults()
+    {
+        var items = new List<(int Slot, uint ItemId, byte Stain0, byte Stain1)>();
+        var usedSlots = new HashSet<int>();
+        var ringIndex = 0;
+
+        foreach (var result in this.results)
+        {
+            if (result.ItemId == 0)
+                continue;
+
+            var slot = result.Slot switch
+            {
+                "主手" => 0,
+                "副手" => 1,
+                "头部" => 2,
+                "上衣" => 3,
+                "手部" => 4,
+                "腿部" => 6,
+                "脚部" => 7,
+                "耳坠" => 8,
+                "项链" => 9,
+                "手镯" => 10,
+                "戒指" => 11 + Math.Min(ringIndex++, 1),
+                _ => -1,
+            };
+
+            if (slot < 0 || !usedSlots.Add(slot))
+                continue;
+
+            var (stain0, stain1) = DyePair(result);
+            items.Add((slot, result.ItemId, stain0, stain1));
+        }
+
+        return items;
+    }
+
+    private unsafe void AddPresetFromCharacterInspect()
+    {
+        var preset = this.CaptureCharacterInspectPreset();
+        if (preset == null)
+        {
+            this.presetStatus = "没有读到角色查看窗口的数据。请先在游戏里打开角色查看窗口。";
+            return;
+        }
+
+        preset.Name = $"查看 {DateTime.Now:yyyy-MM-dd HH:mm}";
+        this.AddPreset(preset, "已从角色查看窗口保存为预设。");
+    }
+
+    private unsafe LKami9GlamourPreset? CaptureCharacterInspectPreset()
+    {
+        if (!InventoryType.Examine.TryGetItems(
+                item => item.ItemId != 0 && Array.IndexOf(InspectPresetSlots, item.Slot) >= 0,
+                out var inspectItems))
+            return null;
+
+        var preset = new LKami9GlamourPreset();
+        foreach (var item in inspectItems)
+        {
+            preset.Items.Add(new LKami9GlamourPresetItem
+            {
+                Slot = item.Slot,
+                ItemID = item.GlamourId != 0 ? item.GlamourId : item.ItemId,
+                Stain0 = item.Stains[0],
+                Stain1 = item.Stains[1],
+            });
+        }
+
+        var uiState = UIState.Instance();
+        if (uiState != null)
+        {
+            preset.GlassesID = uiState->Inspect.GlassesIds[0];
+            preset.HairstyleID = this.ResolveInspectHairstyleId(uiState->Inspect.CustomizeData);
+        }
+
+        return preset.Items.Count == 0 ? null : preset;
+    }
+
+    private unsafe uint ResolveInspectHairstyleId(CustomizeData customizeData)
+    {
+        foreach (var hairMakeType in DalamudServices.DataManager.GetExcelSheet<HairMakeType>())
+        {
+            if (hairMakeType.Tribe.RowId != customizeData.Tribe || hairMakeType.Gender != customizeData.Sex)
+                continue;
+
+            foreach (var rowId in hairMakeType.CharaMakeStruct[0].SubMenuParam)
+            {
+                var hairstyle = DalamudServices.DataManager
+                    .GetExcelSheet<CharaMakeCustomize>()
+                    .GetRow(rowId);
+                if (hairstyle.RowId != 0 && hairstyle.FeatureID == customizeData.Hairstyle)
+                    return hairstyle.RowId;
+            }
+
+            break;
+        }
+
+        return 0;
+    }
+
+    private void AddPreset(LKami9GlamourPreset preset, string message)
+    {
+        if (this.config.Presets.Count >= 100)
+        {
+            this.presetStatus = "预设数量已达上限（100 条）。请先删除不用的预设。";
+            return;
+        }
+
+        this.config.Presets.Add(preset);
+        this.SelectPreset(this.config.Presets.Count - 1);
+        this.presetStatus = message;
+    }
+
+    private void DeleteSelectedPreset()
+    {
+        if (this.selectedPresetIndex < 0 || this.selectedPresetIndex >= this.config.Presets.Count)
+            return;
+
+        var removedIndex = this.selectedPresetIndex;
+        if (this.activePresetIndex == removedIndex)
+            this.StopTryOn(clear: true);
+
+        this.config.Presets.RemoveAt(removedIndex);
+        this.selectedPresetIndex = Math.Min(removedIndex, this.config.Presets.Count - 1);
+        this.presetEditSlot = -1;
+        this.presetStatus = "已删除预设。";
+        this.NormalizePresetSelection();
+
+        if (this.activePresetIndex > removedIndex)
+            this.activePresetIndex--;
+        else if (this.selectedPresetIndex < 0)
+            this.activePresetIndex = -1;
+    }
+
+    private void CopyPresetText(LKami9GlamourPreset preset)
+    {
+        CopyTextToClipboard(this.BuildPresetText(preset));
+        this.presetStatus = "已复制分享文本。";
+    }
+
+    private void ImportOmniPresets()
+    {
+        try
+        {
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "XIVLauncherCN", "pluginConfigs", "OmniToolbox", "TreeHouse", "BetterGlamourManagement.json");
+            if (!File.Exists(path))
+            {
+                this.presetStatus = "没有找到 Omni 幻化管理的配置文件。";
+                return;
+            }
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+            var root = doc.RootElement;
+            if (root.TryGetProperty("Config", out var configNode))
+                root = configNode;
+            if (!root.TryGetProperty("Presets", out var presetsNode) || presetsNode.ValueKind != JsonValueKind.Array)
+            {
+                this.presetStatus = "Omni 配置文件里没有 Presets。";
+                return;
+            }
+
+            var imported = 0;
+            foreach (var source in presetsNode.EnumerateArray())
+            {
+                var preset = ReadOmniPreset(source);
+                if (preset == null || this.config.Presets.Any(existing => PresetFingerprint(existing) == PresetFingerprint(preset)))
+                    continue;
+                if (this.config.Presets.Count >= 100)
+                    break;
+
+                this.config.Presets.Add(preset);
+                imported++;
+            }
+
+            if (imported > 0)
+            {
+                this.SelectPreset(this.config.Presets.Count - 1);
+                this.presetStatus = $"已从 Omni 导入 {imported} 条预设。";
+            }
+            else
+            {
+                this.presetStatus = "没有发现新的 Omni 预设（可能已经全部导入过）。";
+            }
+        }
+        catch (Exception ex)
+        {
+            this.presetStatus = "导入 Omni 预设失败：" + ex.Message;
+            DalamudServices.PluginLog.Information(ex, "[幻化助手] 导入 Omni 幻化预设失败");
+        }
+    }
+
+    private static LKami9GlamourPreset? ReadOmniPreset(JsonElement source)
+    {
+        if (source.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var preset = new LKami9GlamourPreset
+        {
+            Name = source.TryGetProperty("Name", out var name) ? name.GetString() ?? "" : "",
+            GearsetIndex = source.TryGetProperty("GearsetIndex", out var gearset) ? gearset.GetInt32() : -1,
+            GlassesID = source.TryGetProperty("GlassesID", out var glasses) ? glasses.GetUInt32() : 0,
+            HairstyleID = source.TryGetProperty("HairstyleID", out var hairstyle) ? hairstyle.GetUInt32() : 0,
+        };
+
+        if (!source.TryGetProperty("Items", out var items) || items.ValueKind != JsonValueKind.Array)
+            return preset.Items.Count == 0 && preset.GlassesID == 0 && preset.HairstyleID == 0 ? null : preset;
+
+        foreach (var item in items.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var slot = item.TryGetProperty("Slot", out var slotNode) ? slotNode.GetInt32() : -1;
+            if (Array.FindIndex(PresetSlots, x => x.Slot == slot) < 0)
+                continue;
+
+            preset.Items.Add(new LKami9GlamourPresetItem
+            {
+                Slot = slot,
+                ItemID = item.TryGetProperty("ItemID", out var itemId) ? itemId.GetUInt32() : 0,
+                Stain0 = item.TryGetProperty("Stain0", out var stain0) ? stain0.GetByte() : (byte)0,
+                Stain1 = item.TryGetProperty("Stain1", out var stain1) ? stain1.GetByte() : (byte)0,
+            });
+        }
+
+        return preset.Items.Count == 0 && preset.GlassesID == 0 && preset.HairstyleID == 0 ? null : preset;
+    }
+
+    private static string PresetFingerprint(LKami9GlamourPreset preset) =>
+        preset.Name + "|" +
+        string.Join(",", preset.Items
+            .OrderBy(x => x.Slot)
+            .Select(x => $"{x.Slot}:{x.ItemID}:{x.Stain0}:{x.Stain1}")) +
+        $"|{preset.GlassesID}:{preset.HairstyleID}";
+
+    private unsafe void DrawPresetGearsetSelector(LKami9GlamourPreset preset)
+    {
+        var current = preset.GearsetIndex >= 0 && TryGetGearsetName(preset.GearsetIndex, out var currentName)
+            ? $"{preset.GearsetIndex + 1}. {currentName}"
+            : "不绑定套装";
+        ImGui.SetNextItemWidth(260 * ImGuiHelpers.GlobalScale);
+        if (!ImGui.BeginCombo("绑定套装###presetGearset", current))
+            return;
+
+        if (ImGui.Selectable("不绑定套装", preset.GearsetIndex < 0))
+            this.SetPresetGearset(preset, -1);
+
+        for (var index = 0; index < 100; index++)
+        {
+            if (!TryGetGearsetName(index, out var name))
+                continue;
+
+            if (ImGui.Selectable($"{index + 1}. {name}###presetGearset{index}", preset.GearsetIndex == index))
+                this.SetPresetGearset(preset, index);
+        }
+
+        ImGui.EndCombo();
+    }
+
+    private unsafe bool TryGetGearsetName(int index, out string name)
+    {
+        name = "";
+        var module = RaptureGearsetModule.Instance();
+        var gearset = module != null ? module->GetGearset(index) : null;
+        if (gearset == null ||
+            gearset->Id != index ||
+            !gearset->Flags.HasFlag(RaptureGearsetModule.GearsetFlag.Exists))
+            return false;
+
+        name = gearset->NameString;
+        return !string.IsNullOrWhiteSpace(name);
+    }
+
+    private void SetPresetGearset(LKami9GlamourPreset preset, int gearsetIndex)
+    {
+        if (gearsetIndex >= 0)
+        {
+            foreach (var other in this.config.Presets)
+            {
+                if (!ReferenceEquals(other, preset) && other.GearsetIndex == gearsetIndex)
+                    other.GearsetIndex = -1;
+            }
+        }
+
+        preset.GearsetIndex = gearsetIndex;
+        this.lastGearsetIndex = int.MinValue;
+        this.presetStatus = gearsetIndex >= 0
+            ? $"已绑定到套装 {gearsetIndex + 1}。切换该套装时会自动试穿。"
+            : "已取消套装绑定。";
+    }
+
+    private unsafe void TickGearsetBinding()
+    {
+        if (!this.config.AutoApplyBoundPreset ||
+            !DalamudServices.ClientState.IsLoggedIn ||
+            DalamudServices.ObjectTable.LocalPlayer == null)
+            return;
+
+        var module = RaptureGearsetModule.Instance();
+        if (module == null)
+        {
+            this.lastGearsetIndex = int.MinValue;
+            return;
+        }
+
+        var current = module->CurrentGearsetIndex;
+        if (current == this.lastGearsetIndex)
+            return;
+
+        this.lastGearsetIndex = current;
+        var presetIndex = this.config.Presets.FindIndex(x => x.GearsetIndex == current);
+        if (presetIndex >= 0)
+        {
+            this.StartTryOnPreset(presetIndex, true);
+        }
+        else if (this.activePresetFromGearset)
+        {
+            this.StopTryOn(clear: true);
+            this.activePresetFromGearset = false;
+        }
+    }
+
+    private void DrawPresetItemTable(LKami9GlamourPreset preset)
+    {
+        if (!ImGui.BeginTable("###presetItems", 5,
+                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit))
+            return;
+
+        ImGui.TableSetupColumn("部位", ImGuiTableColumnFlags.WidthFixed, 58 * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 30 * ImGuiHelpers.GlobalScale);
+        ImGui.TableSetupColumn("装备", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("染剂", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 38 * ImGuiHelpers.GlobalScale);
+        ImGui.TableHeadersRow();
+
+        foreach (var (slot, slotName) in PresetSlots)
+        {
+            var item = preset.Items.Find(x => x.Slot == slot);
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(slotName);
+
+            ImGui.TableNextColumn();
+            if (item is { ItemID: not 0 })
+                DrawGameIcon(GetPresetItemIcon(item.ItemID), 24f);
+
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(item is { ItemID: not 0 } ? GetPresetItemName(item.ItemID) : "无");
+
+            ImGui.TableNextColumn();
+            if (item is null || item.ItemID == 0)
+                ImGui.TextDisabled("—");
+            else
+                ImGui.TextUnformatted(PresetDyeText(item));
+
+            ImGui.TableNextColumn();
+            if (ImGui.SmallButton($"改###presetItemEdit{slot}"))
+                this.PreparePresetItemEditor(preset, slot, item);
+        }
+
+        ImGui.EndTable();
+
+        if (this.presetEditSlot >= 0)
+            this.DrawPresetItemEditor(preset);
+    }
+
+    private void PreparePresetItemEditor(LKami9GlamourPreset preset, int slot, LKami9GlamourPresetItem? item)
+    {
+        this.presetEditSlot = slot;
+        this.presetItemCandidates.Clear();
+        this.presetItemInput = item is { ItemID: not 0 } ? GetPresetItemName(item.ItemID) : "";
+        this.presetDye0Input = item is { Stain0: not 0 } ? GetDyeName(item.Stain0) : "";
+        this.presetDye1Input = item is { Stain1: not 0 } ? GetDyeName(item.Stain1) : "";
+    }
+
+    private void DrawPresetItemEditor(LKami9GlamourPreset preset)
+    {
+        var slotName = PresetSlots.FirstOrDefault(x => x.Slot == this.presetEditSlot).Name;
+        ImGui.Separator();
+        ImGui.TextColored(this.WarnVec, $"编辑预设部位：{slotName}");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("关闭"))
+        {
+            this.presetEditSlot = -1;
+            return;
+        }
+
+        ImGui.SetNextItemWidth(300 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("装备名/ID###presetItemInput", ref this.presetItemInput, 128);
+        ImGui.SameLine();
+        if (ImGui.Button("确认装备"))
+            this.ApplyPresetItemInput(preset);
+        ImGui.SameLine();
+        if (ImGui.Button("清空"))
+        {
+            preset.Items.RemoveAll(x => x.Slot == this.presetEditSlot);
+            this.presetItemInput = "";
+            this.presetDye0Input = "";
+            this.presetDye1Input = "";
+            this.presetItemCandidates.Clear();
+            this.presetStatus = "已清空该部位。";
+        }
+
+        if (this.presetItemCandidates.Count > 0)
+        {
+            ImGui.TextDisabled("候选：");
+            for (var i = 0; i < this.presetItemCandidates.Count; i++)
+            {
+                if (!ImGui.SmallButton($"{this.presetItemCandidates[i]}###presetItemCandidate{i}"))
+                    continue;
+                this.presetItemInput = this.presetItemCandidates[i];
+                this.ApplyPresetItemInput(preset);
+                break;
+            }
+        }
+
+        ImGui.SetNextItemWidth(180 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("染剂 1###presetDye0", ref this.presetDye0Input, 64);
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(180 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("染剂 2###presetDye1", ref this.presetDye1Input, 64);
+        ImGui.SameLine();
+        if (ImGui.Button("确认染剂"))
+            this.ApplyPresetDyeInput(preset);
+    }
+
+    private void ApplyPresetItemInput(LKami9GlamourPreset preset)
+    {
+        var candidates = new List<string>();
+        var resolved = this.ResolveItem(this.presetItemInput, candidates);
+        if (resolved == null)
+        {
+            this.presetStatus = $"没有找到装备「{this.presetItemInput}」。";
+            this.presetItemCandidates.Clear();
+            return;
+        }
+
+        var item = resolved.Value;
+        var entry = preset.Items.Find(x => x.Slot == this.presetEditSlot);
+        if (entry == null)
+        {
+            entry = new LKami9GlamourPresetItem { Slot = this.presetEditSlot };
+            preset.Items.Add(entry);
+        }
+
+        entry.ItemID = item.Id;
+        this.presetItemInput = item.Name;
+        this.presetItemCandidates.Clear();
+        this.presetItemCandidates.AddRange(candidates);
+
+        var expected = PresetSlotToResultSlot(this.presetEditSlot);
+        this.presetStatus = item.Slot == expected
+            ? "已更新预设部位。"
+            : $"已填入，但游戏数据里它属于「{item.Slot}」，当前预设部位是「{expected}」。";
+    }
+
+    private void ApplyPresetDyeInput(LKami9GlamourPreset preset)
+    {
+        var entry = preset.Items.Find(x => x.Slot == this.presetEditSlot);
+        if (entry == null || entry.ItemID == 0)
+        {
+            this.presetStatus = "请先给这个部位选择装备。";
+            return;
+        }
+
+        var dye0 = this.ResolvePresetDye(this.presetDye0Input);
+        var dye1 = this.ResolvePresetDye(this.presetDye1Input);
+        if (!dye0.Ok || !dye1.Ok)
+        {
+            this.presetStatus = "有染剂名称无法识别。";
+            return;
+        }
+
+        entry.Stain0 = dye0.Id;
+        entry.Stain1 = dye1.Id;
+        this.presetStatus = "已更新预设染剂。";
+    }
+
+    private (bool Ok, byte Id) ResolvePresetDye(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input) ||
+            input.Trim() is "无" or "无染色" or "不可染色")
+            return (true, 0);
+
+        var candidates = new List<string>();
+        var dye = this.ResolveDye(input, candidates);
+        return dye == null || dye.Value.Id > byte.MaxValue
+            ? (false, 0)
+            : (true, (byte)dye.Value.Id);
+    }
+
+    private void DrawPresetSpecialRows(LKami9GlamourPreset preset)
+    {
+        ImGui.Separator();
+        ImGui.TextDisabled("发型 / 眼镜（只影响 Omni 式本地试穿，不写入游戏幻化模板）");
+
+        ImGui.SetNextItemWidth(250 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("发型名称/ID###presetHairstyle", ref this.presetHairstyleInput, 96);
+        ImGui.SameLine();
+        if (ImGui.Button("确认发型"))
+        {
+            var id = this.ResolveHairstyleInput(this.presetHairstyleInput);
+            if (id == null)
+            {
+                this.presetStatus = "没有找到这个发型。";
+            }
+            else
+            {
+                preset.HairstyleID = id.Value;
+                this.presetHairstyleInput = GetHairstyleName(id.Value);
+                this.presetStatus = "已更新预设发型。";
+            }
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled("留空或输入 0 = 不动发型");
+
+        ImGui.SetNextItemWidth(250 * ImGuiHelpers.GlobalScale);
+        ImGui.InputText("眼镜名称/ID###presetGlasses", ref this.presetGlassesInput, 96);
+        ImGui.SameLine();
+        if (ImGui.Button("确认眼镜"))
+        {
+            var id = this.ResolveGlassesInput(this.presetGlassesInput);
+            if (id == null)
+            {
+                this.presetStatus = "没有找到这个眼镜/面部配饰。";
+            }
+            else
+            {
+                preset.GlassesID = id.Value;
+                this.presetGlassesInput = GetGlassesName(id.Value);
+                this.presetStatus = "已更新预设眼镜。";
+            }
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled("留空或输入 0 = 不戴");
+    }
+
+    private static string PresetSlotToResultSlot(int slot) => slot switch
+    {
+        0 => "主手",
+        1 => "副手",
+        2 => "头部",
+        3 => "上衣",
+        4 => "手部",
+        6 => "腿部",
+        7 => "脚部",
+        8 => "耳坠",
+        9 => "项链",
+        10 => "手镯",
+        11 or 12 => "戒指",
+        _ => "",
+    };
+
+    private string BuildPresetText(LKami9GlamourPreset preset)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("发型：" + GetHairstyleName(preset.HairstyleID));
+        sb.AppendLine("武器：" + FormatPresetWeapon(preset));
+        AppendPresetPair(sb, preset, 2, "头部", 8, "耳饰");
+        AppendPresetPair(sb, preset, 3, "身体", 9, "项链");
+        AppendPresetPair(sb, preset, 4, "手部", 10, "手镯");
+        AppendPresetPair(sb, preset, 6, "腿部", 11, "右戒指");
+        AppendPresetPair(sb, preset, 7, "脚部", 12, "左戒指");
+        sb.AppendLine("眼镜：" + GetGlassesName(preset.GlassesID));
+        return sb.ToString().TrimEnd();
+    }
+
+    private string FormatPresetWeapon(LKami9GlamourPreset preset)
+    {
+        var main = FormatPresetItem(preset.Items.Find(x => x.Slot == 0));
+        var off = preset.Items.Find(x => x.Slot == 1);
+        return off is { ItemID: not 0 }
+            ? $"主手：{main}；副手：{FormatPresetItem(off)}"
+            : main;
+    }
+
+    private void AppendPresetPair(
+        StringBuilder builder,
+        LKami9GlamourPreset preset,
+        int leftSlot,
+        string leftName,
+        int rightSlot,
+        string rightName)
+    {
+        builder.AppendLine(
+            $"{leftName}：{FormatPresetItem(preset.Items.Find(x => x.Slot == leftSlot))}    " +
+            $"{rightName}：{FormatPresetItem(preset.Items.Find(x => x.Slot == rightSlot))}");
+    }
+
+    private string FormatPresetItem(LKami9GlamourPresetItem? item)
+    {
+        if (item is null || item.ItemID == 0)
+            return "无";
+
+        var name = GetPresetItemName(item.ItemID);
+        if (item.Stain0 != 0)
+            name += " " + GetDyeName(item.Stain0);
+        if (item.Stain1 != 0)
+            name += " " + GetDyeName(item.Stain1);
+        return name;
+    }
+
+    private string PresetDyeText(LKami9GlamourPresetItem item)
+    {
+        var parts = new List<string>();
+        if (item.Stain0 != 0)
+            parts.Add(GetDyeName(item.Stain0));
+        if (item.Stain1 != 0)
+            parts.Add(GetDyeName(item.Stain1));
+        return parts.Count == 0 ? "无染色" : string.Join(" / ", parts);
+    }
+
+    private static string DisplayPresetName(LKami9GlamourPreset preset) =>
+        string.IsNullOrWhiteSpace(preset.Name) ? "未命名预设" : preset.Name;
+
+    private string GetPresetItemName(uint itemId)
+    {
+        if (itemId == 0)
+            return "无";
+        try
+        {
+            var name = DalamudServices.DataManager.GetExcelSheet<Item>().GetRow(itemId).Name.ToString();
+            return string.IsNullOrWhiteSpace(name) ? $"道具 #{itemId}" : name;
+        }
+        catch
+        {
+            return $"道具 #{itemId}";
+        }
+    }
+
+    private uint GetPresetItemIcon(uint itemId)
+    {
+        if (itemId == 0)
+            return 0;
+        try
+        {
+            return DalamudServices.DataManager.GetExcelSheet<Item>().GetRow(itemId).Icon;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private string GetDyeName(byte stainId)
+    {
+        if (stainId == 0)
+            return "无染色";
+
+        this.BuildIndexIfNeeded();
+        return this.stainNameById != null && this.stainNameById.TryGetValue(stainId, out var name)
+            ? name
+            : $"染剂 #{stainId}";
+    }
+
+    private void EnsureGlassesIndex()
+    {
+        if (this.glassesByName != null && this.glassesNameById != null)
+            return;
+
+        var byName = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        var byId = new Dictionary<uint, string>();
+        foreach (var row in DalamudServices.DataManager.GetExcelSheet<Glasses>())
+        {
+            if (row.RowId == 0)
+                continue;
+
+            var name = row.Name.ToString();
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            byName.TryAdd(name, row.RowId);
+            byId.TryAdd(row.RowId, name);
+        }
+
+        this.glassesByName = byName;
+        this.glassesNameById = byId;
+    }
+
+    private string GetGlassesName(uint glassesId)
+    {
+        if (glassesId == 0)
+            return "无";
+
+        this.EnsureGlassesIndex();
+        return this.glassesNameById!.TryGetValue(glassesId, out var name)
+            ? name
+            : $"眼镜 #{glassesId}";
+    }
+
+    private uint? ResolveGlassesInput(string input)
+    {
+        var text = input.Trim();
+        if (text.Length == 0 || text == "无")
+            return 0;
+        if (uint.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var numeric))
+            return numeric;
+
+        this.EnsureGlassesIndex();
+        if (this.glassesByName!.TryGetValue(text, out var exact))
+            return exact;
+
+        var contains = this.glassesByName.Keys
+            .Where(x => x.Contains(text, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => Math.Abs(x.Length - text.Length))
+            .Take(1)
+            .FirstOrDefault();
+        return contains != null ? this.glassesByName[contains] : null;
+    }
+
+    private void EnsureHairstyleIndex()
+    {
+        if (this.hairstyleByName != null && this.hairstyleNameById != null)
+            return;
+
+        var validRows = new HashSet<uint>();
+        foreach (var hairMakeType in DalamudServices.DataManager.GetExcelSheet<HairMakeType>())
+        {
+            foreach (var rowId in hairMakeType.CharaMakeStruct[0].SubMenuParam)
+            {
+                if (rowId != 0)
+                    validRows.Add(rowId);
+            }
+        }
+
+        var unlockNames = new Dictionary<uint, string>();
+        foreach (var item in DalamudServices.DataManager.GetExcelSheet<Item>())
+        {
+            try
+            {
+                if (!item.ItemAction.IsValid)
+                    continue;
+
+                var action = item.ItemAction.Value;
+                if (action.Action.RowId == 2633 && action.Data[0] > 0)
+                    unlockNames.TryAdd((uint)action.Data[0], item.Name.ToString());
+            }
+            catch { }
+        }
+
+        var byName = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        var byId = new Dictionary<uint, string>();
+        foreach (var row in DalamudServices.DataManager.GetExcelSheet<CharaMakeCustomize>())
+        {
+            if (!validRows.Contains(row.RowId) || row.FeatureID > byte.MaxValue)
+                continue;
+
+            var name = "";
+            try
+            {
+                var hint = row.HintItem.ValueNullable;
+                if (hint is { } item)
+                    name = item.Name.ToString();
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(name) && row.UnlockLink != 0)
+                unlockNames.TryGetValue(row.UnlockLink, out name);
+            if (string.IsNullOrWhiteSpace(name))
+                name = $"发型 {row.FeatureID}";
+
+            byId.TryAdd(row.RowId, name);
+            byName.TryAdd(name, row.RowId);
+            byName.TryAdd($"发型 {row.FeatureID}", row.RowId);
+        }
+
+        this.hairstyleByName = byName;
+        this.hairstyleNameById = byId;
+    }
+
+    private string GetHairstyleName(uint hairstyleId)
+    {
+        if (hairstyleId == 0)
+            return "无";
+
+        try
+        {
+            var row = DalamudServices.DataManager.GetExcelSheet<CharaMakeCustomize>().GetRow(hairstyleId);
+            var hint = row.HintItem.ValueNullable;
+            if (hint is { } item && !string.IsNullOrWhiteSpace(item.Name.ToString()))
+                return item.Name.ToString();
+            if (row.RowId != 0)
+                return $"发型 {row.FeatureID}";
+        }
+        catch { }
+
+        return $"发型 #{hairstyleId}";
+    }
+
+    private uint? ResolveHairstyleInput(string input)
+    {
+        var text = input.Trim();
+        if (text.Length == 0 || text == "无")
+            return 0;
+
+        this.EnsureHairstyleIndex();
+        if (uint.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var numeric))
+        {
+            if (this.hairstyleNameById!.ContainsKey(numeric))
+                return numeric;
+
+            var byFeature = this.hairstyleByName!.TryGetValue($"发型 {numeric}", out var featureId)
+                ? featureId
+                : (uint?)null;
+            return byFeature;
+        }
+
+        if (this.hairstyleByName!.TryGetValue(text, out var exact))
+            return exact;
+
+        var contains = this.hairstyleByName.Keys
+            .Where(x => x.Contains(text, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => Math.Abs(x.Length - text.Length))
+            .Take(1)
+            .FirstOrDefault();
+        return contains != null ? this.hairstyleByName[contains] : null;
     }
 
     // ══════════════════════════════════════════════════════════
@@ -2891,6 +3999,25 @@ public sealed class UnknownFragment
     public string Hint = "";
 }
 
+[Serializable]
+public sealed class LKami9GlamourPreset
+{
+    public string Name { get; set; } = "";
+    public int GearsetIndex { get; set; } = -1;
+    public uint GlassesID { get; set; }
+    public uint HairstyleID { get; set; }
+    public List<LKami9GlamourPresetItem> Items { get; set; } = [];
+}
+
+[Serializable]
+public sealed class LKami9GlamourPresetItem
+{
+    public int Slot { get; set; }
+    public uint ItemID { get; set; }
+    public byte Stain0 { get; set; }
+    public byte Stain1 { get; set; }
+}
+
 public sealed class LKami9GlamourHelperConfig
 {
     public string LastImagePath { get; set; } = "";
@@ -2899,4 +4026,10 @@ public sealed class LKami9GlamourHelperConfig
 
     /// <summary>把没识别上的片段也列出来供手动指派（默认开）。</summary>
     public bool ShowUnknowns { get; set; } = true;
+
+    /// <summary>Omni「更好的幻化管理」等价预设。</summary>
+    public List<LKami9GlamourPreset> Presets { get; set; } = [];
+
+    /// <summary>切换套装时自动试穿绑定的预设。</summary>
+    public bool AutoApplyBoundPreset { get; set; } = true;
 }
