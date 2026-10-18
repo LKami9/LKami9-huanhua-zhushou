@@ -98,6 +98,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private bool standaloneUiHooked;
     private bool mainWindowOpen;
     private bool mainWindowCollapsed;
+    private bool mainWindowResizePending;
     private System.Numerics.Vector2 mainWindowExpandedSize;
 
     // ── Omni 幻化管理整合 ──
@@ -197,6 +198,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
         this.StopTryOn(clear: true);
         this.mainWindowOpen = false;
+        this.mainWindowCollapsed = false;
+        this.mainWindowResizePending = true;
         this.lastGearsetIndex = int.MinValue;
         this.activePresetIndex = -1;
         this.activePresetFromGearset = false;
@@ -224,13 +227,15 @@ public sealed class LKami9GlamourHelper : ModuleBase
         var arg = (arguments ?? "").Trim().ToLowerInvariant();
         if (arg is "open" or "window" or "界面" or "打开")
         {
-            this.mainWindowOpen = true;
+            this.OpenMainWindow();
             return true;
         }
 
         if (arg is "close" or "关闭")
         {
             this.mainWindowOpen = false;
+            this.mainWindowCollapsed = false;
+            this.mainWindowResizePending = true;
             return true;
         }
 
@@ -245,6 +250,17 @@ public sealed class LKami9GlamourHelper : ModuleBase
         return false;
     }
 
+    private void OpenMainWindow()
+    {
+        if (this.mainWindowCollapsed)
+        {
+            this.mainWindowCollapsed = false;
+            this.mainWindowResizePending = true;
+        }
+
+        this.mainWindowOpen = true;
+    }
+
     // ══════════════════════════════════════════════════════════
     //  UI
     // ══════════════════════════════════════════════════════════
@@ -254,7 +270,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.TextUnformatted("LKami9幻化助手");
         ImGui.TextDisabled("主界面已改为独立窗口，可在游戏里连续缩放、移动和查看。");
         if (ImGui.Button("打开幻化助手窗口"))
-            this.mainWindowOpen = true;
+            this.OpenMainWindow();
 
         ImGui.SameLine();
         var showInspect = this.config.ShowInspectQuickActions;
@@ -271,12 +287,86 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
     private void DrawAssistantContent()
     {
+        DrawWorkspaceSummary();
+        ImGui.Separator();
+
+        if (!ImGui.BeginTabBar("###LKami9GlamourTabs", ImGuiTabBarFlags.FittingPolicyScroll))
+            return;
+
+        if (ImGui.BeginTabItem("识别与装备"))
+        {
+            DrawIdentifyTab();
+            ImGui.EndTabItem();
+        }
+
+        if (ImGui.BeginTabItem("试穿与模板"))
+        {
+            DrawTryOnPlateTab();
+            ImGui.EndTabItem();
+        }
+
+        if (ImGui.BeginTabItem("幻化预设"))
+        {
+            DrawPresetTab();
+            ImGui.EndTabItem();
+        }
+
+        ImGui.EndTabBar();
+    }
+
+    private void DrawWorkspaceSummary()
+    {
+        var filled = this.CountFilledResultSlots();
+        var stateText = this.busy ? "识别中" : this.tryOnActive ? "本地试穿中" : "就绪";
+        var stateColor = this.busy || this.tryOnActive
+            ? OmniTheme.Tokens.Accent
+            : OmniTheme.Tokens.Success;
+
+        ImGui.TextColored(stateColor, stateText);
+        ImGui.SameLine();
+        ImGui.TextDisabled($"装备 {filled}/14");
+        ImGui.SameLine();
+        ImGui.TextDisabled("|");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"预设 {this.config.Presets.Count} 个");
+        ImGui.SameLine();
+        ImGui.TextDisabled("|");
+        ImGui.SameLine();
+        ImGui.TextDisabled(this.config.ShowInspectQuickActions ? "角色快捷栏已开启" : "角色快捷栏已关闭");
+    }
+
+    private void DrawIdentifyTab()
+    {
+        ImGui.BeginChild("###identifyTab", System.Numerics.Vector2.Zero, false, ImGuiWindowFlags.None);
         DrawInputSection();
         ImGui.Separator();
         DrawResultSection();
+        ImGui.EndChild();
+    }
+
+    private void DrawTryOnPlateTab()
+    {
+        ImGui.BeginChild("###tryOnPlateTab", System.Numerics.Vector2.Zero, false, ImGuiWindowFlags.None);
         DrawPlateSection();
         DrawTryOnSection();
+        ImGui.EndChild();
+    }
+
+    private void DrawPresetTab()
+    {
+        ImGui.BeginChild("###presetTab", System.Numerics.Vector2.Zero, false, ImGuiWindowFlags.None);
         DrawPresetSection();
+        ImGui.EndChild();
+    }
+
+    private static void DrawSectionTitle(string title, string subtitle = "")
+    {
+        ImGui.TextColored(OmniTheme.Tokens.Accent, title);
+        if (string.IsNullOrEmpty(subtitle))
+            return;
+
+        ImGui.SameLine();
+        ImGui.TextDisabled(subtitle);
     }
 
     private void DrawStandaloneUi()
@@ -355,13 +445,33 @@ public sealed class LKami9GlamourHelper : ModuleBase
     {
         var open = this.mainWindowOpen;
         var viewport = ImGui.GetMainViewport();
-        var initialSize = OmniTheme.Scale(new System.Numerics.Vector2(1100f, 760f));
-        ImGui.SetNextWindowSize(
-            System.Numerics.Vector2.Min(initialSize, viewport.WorkSize),
-            ImGuiCond.FirstUseEver);
+        var initialSize = OmniTheme.Scale(new System.Numerics.Vector2(1050f, 720f));
+        if (this.mainWindowExpandedSize == System.Numerics.Vector2.Zero)
+            this.mainWindowExpandedSize = initialSize;
+
+        var collapsedSize = OmniTheme.CollapsedWindowSize(this.mainWindowExpandedSize.X);
+        var targetSize = this.mainWindowCollapsed ? collapsedSize : this.mainWindowExpandedSize;
+        var minimumSize = this.mainWindowCollapsed
+            ? new System.Numerics.Vector2(OmniTheme.Scale(360f), collapsedSize.Y)
+            : OmniTheme.Scale(new System.Numerics.Vector2(820f, 540f));
+
         ImGui.SetNextWindowSizeConstraints(
-            OmniTheme.Scale(new System.Numerics.Vector2(680f, 480f)),
+            minimumSize,
             viewport.WorkSize);
+
+        if (this.mainWindowResizePending)
+        {
+            ImGui.SetNextWindowSize(targetSize, ImGuiCond.Always);
+            this.mainWindowResizePending = false;
+        }
+        else if (!this.mainWindowCollapsed)
+        {
+            var firstUseSize = System.Numerics.Vector2.Min(initialSize, viewport.WorkSize);
+            ImGui.SetNextWindowSize(firstUseSize, ImGuiCond.FirstUseEver);
+            ImGui.SetNextWindowPos(
+                viewport.WorkPos + (viewport.WorkSize - firstUseSize) * 0.5f,
+                ImGuiCond.FirstUseEver);
+        }
 
         PushOmniWindowStyle();
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, System.Numerics.Vector2.Zero);
@@ -372,7 +482,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
                     ref open,
                     ImGuiWindowFlags.NoTitleBar |
                     ImGuiWindowFlags.NoCollapse |
-                    ImGuiWindowFlags.NoDocking))
+                    ImGuiWindowFlags.NoDocking |
+                    ImGuiWindowFlags.NoScrollbar))
             {
                 var framePosition = ImGui.GetWindowPos();
                 var frameSize = ImGui.GetWindowSize();
@@ -385,32 +496,54 @@ public sealed class LKami9GlamourHelper : ModuleBase
                     "###LKami9GlamourMainClose");
 
                 if (chrome.CloseClicked)
+                {
                     open = false;
+                    this.mainWindowCollapsed = false;
+                    this.mainWindowResizePending = true;
+                }
 
                 if (chrome.ToggleCollapse)
                 {
                     if (this.mainWindowCollapsed)
                     {
                         this.mainWindowCollapsed = false;
-                        ImGui.SetWindowSize(this.mainWindowExpandedSize == System.Numerics.Vector2.Zero
-                            ? initialSize
-                            : this.mainWindowExpandedSize);
+                        this.mainWindowResizePending = true;
                     }
                     else
                     {
                         this.mainWindowExpandedSize = frameSize;
                         this.mainWindowCollapsed = true;
-                        ImGui.SetWindowSize(OmniTheme.CollapsedWindowSize(frameSize.X));
+                        this.mainWindowResizePending = true;
                     }
+                }
+                else if (!this.mainWindowCollapsed)
+                {
+                    this.mainWindowExpandedSize = frameSize;
                 }
 
                 if (!this.mainWindowCollapsed)
                 {
                     var (contentPosition, contentSize) = OmniWindowChrome.GetContentBounds(framePosition, frameSize);
                     ImGui.SetCursorScreenPos(contentPosition);
-                    ImGui.PushItemWidth(MathF.Max(1f, contentSize.X));
-                    this.DrawAssistantContent();
-                    ImGui.PopItemWidth();
+                    ImGui.PushStyleVar(
+                        ImGuiStyleVar.WindowPadding,
+                        OmniTheme.Scale(new System.Numerics.Vector2(14f, 12f)));
+                    try
+                    {
+                        ImGui.BeginChild(
+                            "###LKami9GlamourContent",
+                            contentSize,
+                            false,
+                            ImGuiWindowFlags.NoScrollbar);
+                        ImGui.PushItemWidth(MathF.Max(1f, ImGui.GetContentRegionAvail().X));
+                        this.DrawAssistantContent();
+                        ImGui.PopItemWidth();
+                        ImGui.EndChild();
+                    }
+                    finally
+                    {
+                        ImGui.PopStyleVar();
+                    }
                 }
             }
 
@@ -440,49 +573,73 @@ public sealed class LKami9GlamourHelper : ModuleBase
         var inspectState = addon->WindowNode->GetNodeState();
         var viewport = ImGui.GetMainViewport();
         var min = viewport.WorkPos + new System.Numerics.Vector2(8f);
-        var overlaySize = OmniTheme.Scale(new System.Numerics.Vector2(310f, 220f));
+        var max = viewport.WorkPos + viewport.WorkSize;
+        var overlaySize = OmniTheme.Scale(new System.Numerics.Vector2(272f, 176f));
+        var gap = OmniTheme.Scale(8f);
         var inspectRight = inspectState.TopLeft.X + inspectState.Width;
         var inspectCenter = inspectState.TopLeft.X + inspectState.Width * 0.5f;
+        var inspectCenterY = inspectState.TopLeft.Y + MathF.Max(0f, (inspectState.Height - overlaySize.Y) * 0.5f);
         var betterAddon = manager->GetAddonByName("OmniBetterGlamourActions");
         var betterVisible = betterAddon != null &&
                             betterAddon->IsVisible &&
                             betterAddon->WindowNode != null;
+        var betterPosition = System.Numerics.Vector2.Zero;
+        var betterSize = System.Numerics.Vector2.Zero;
         var preferLeft = false;
         if (betterVisible)
         {
             var betterState = betterAddon->WindowNode->GetNodeState();
+            betterPosition = betterState.TopLeft;
+            betterSize = new System.Numerics.Vector2(betterState.Width, betterState.Height);
             preferLeft = betterState.TopLeft.X + betterState.Width * 0.5f >= inspectCenter;
         }
 
-        var rightX = inspectRight + 6f;
-        var leftX = inspectState.TopLeft.X - overlaySize.X - 6f;
-        var screenRight = viewport.WorkPos.X + viewport.WorkSize.X - overlaySize.X - 8f;
-        var hasRight = rightX <= screenRight;
-        var hasLeft = leftX >= min.X;
+        var right = new System.Numerics.Vector2(inspectRight + gap, inspectCenterY);
+        var left = new System.Numerics.Vector2(inspectState.TopLeft.X - overlaySize.X - gap, inspectCenterY);
+        var above = new System.Numerics.Vector2(
+            inspectState.TopLeft.X + (inspectState.Width - overlaySize.X) * 0.5f,
+            inspectState.TopLeft.Y - overlaySize.Y - gap);
+        var below = new System.Numerics.Vector2(
+            inspectState.TopLeft.X + (inspectState.Width - overlaySize.X) * 0.5f,
+            inspectState.TopLeft.Y + inspectState.Height + gap);
 
-        float x;
-        float y = inspectState.TopLeft.Y;
-        if (preferLeft && hasLeft)
-            x = leftX;
-        else if (!preferLeft && hasRight)
-            x = rightX;
-        else if (hasLeft)
-            x = leftX;
-        else if (hasRight)
-            x = rightX;
-        else
+        var candidates = preferLeft
+            ? new[] { left, below, above, right }
+            : new[] { right, below, above, left };
+
+        System.Numerics.Vector2? chosen = null;
+        foreach (var candidate in candidates)
         {
-            x = inspectState.TopLeft.X;
-            y = inspectState.TopLeft.Y + inspectState.Height + 6f;
+            if (!IsOverlayInside(candidate, overlaySize, min, max))
+                continue;
+            if (betterVisible &&
+                RectanglesOverlap(candidate, overlaySize, betterPosition, betterSize))
+                continue;
+
+            chosen = candidate;
+            break;
         }
 
-        var max = viewport.WorkPos + viewport.WorkSize - overlaySize;
+        if (chosen == null)
+        {
+            foreach (var candidate in candidates)
+            {
+                if (!IsOverlayInside(candidate, overlaySize, min, max))
+                    continue;
+
+                chosen = candidate;
+                break;
+            }
+        }
+
+        var desired = chosen ?? (preferLeft ? left : right);
         var position = System.Numerics.Vector2.Clamp(
-            new System.Numerics.Vector2(x, y),
+            desired,
             min,
-            System.Numerics.Vector2.Max(min, max));
+            System.Numerics.Vector2.Max(min, max - overlaySize));
 
         ImGui.SetNextWindowPos(position, ImGuiCond.Always);
+        ImGui.SetNextWindowSize(overlaySize, ImGuiCond.Always);
         var show = this.config.ShowInspectQuickActions;
         PushOmniWindowStyle();
         try
@@ -490,30 +647,51 @@ public sealed class LKami9GlamourHelper : ModuleBase
             if (ImGui.Begin(
                     "LKami9幻化助手###LKami9GlamourInspectActions",
                     ref show,
-                    ImGuiWindowFlags.AlwaysAutoResize |
+                    ImGuiWindowFlags.NoTitleBar |
                     ImGuiWindowFlags.NoResize |
                     ImGuiWindowFlags.NoCollapse |
-                    ImGuiWindowFlags.NoDocking))
+                    ImGuiWindowFlags.NoDocking |
+                    ImGuiWindowFlags.NoSavedSettings |
+                    ImGuiWindowFlags.NoScrollbar))
             {
                 OmniControls.DrawPopupBackground();
-                ImGui.TextDisabled("当前角色查看");
-                if (ImGui.Button("试穿该角色"))
+                ImGui.TextColored(OmniTheme.Tokens.Accent, "角色查看");
+                ImGui.SameLine();
+                ImGui.SetCursorPosX(
+                    ImGui.GetWindowWidth() -
+                    ImGui.GetStyle().WindowPadding.X -
+                    ImGui.CalcTextSize("隐藏").X -
+                    ImGui.GetStyle().FramePadding.X * 2f);
+                if (ImGui.SmallButton("隐藏###hideInspectQuickActions"))
+                    show = false;
+                ImGui.Separator();
+
+                var spacing = ImGui.GetStyle().ItemSpacing.X;
+                var buttonWidth = (ImGui.GetContentRegionAvail().X - spacing) * 0.5f;
+                if (ImGui.Button("试穿角色###inspectTryOn", new System.Numerics.Vector2(buttonWidth, 0)))
                     this.TryOnInspectedCharacter();
                 ImGui.SameLine();
-                if (ImGui.Button("保存为预设"))
+                if (ImGui.Button("保存预设###inspectSave", new System.Numerics.Vector2(buttonWidth, 0)))
                     this.AddPresetFromCharacterInspect();
-                ImGui.SameLine();
-                if (ImGui.Button("复制分享文本"))
-                    this.CopyInspectedPresetToClipboard();
 
-                if (ImGui.Button("打开完整助手"))
-                    this.mainWindowOpen = true;
+                if (ImGui.Button("复制分享###inspectShare", new System.Numerics.Vector2(buttonWidth, 0)))
+                    this.CopyInspectedPresetToClipboard();
                 ImGui.SameLine();
-                if (ImGui.Button("清除试穿"))
+                if (ImGui.Button("打开助手###inspectOpen", new System.Numerics.Vector2(buttonWidth, 0)))
+                    this.OpenMainWindow();
+
+                if (ImGui.Button("清除试穿###inspectClear", new System.Numerics.Vector2(-1f, 0)))
                     this.StopTryOn(clear: true);
 
                 if (!string.IsNullOrEmpty(this.presetStatus))
-                    ImGui.TextWrapped(this.presetStatus);
+                {
+                    var shortStatus = this.presetStatus.Length > 20
+                        ? this.presetStatus[..20] + "…"
+                        : this.presetStatus;
+                    ImGui.TextDisabled(shortStatus);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(this.presetStatus);
+                }
             }
 
             this.config.ShowInspectQuickActions = show;
@@ -523,6 +701,30 @@ public sealed class LKami9GlamourHelper : ModuleBase
         {
             PopOmniWindowStyle();
         }
+    }
+
+    private static bool IsOverlayInside(
+        System.Numerics.Vector2 position,
+        System.Numerics.Vector2 size,
+        System.Numerics.Vector2 min,
+        System.Numerics.Vector2 max)
+    {
+        return position.X >= min.X &&
+               position.Y >= min.Y &&
+               position.X + size.X <= max.X &&
+               position.Y + size.Y <= max.Y;
+    }
+
+    private static bool RectanglesOverlap(
+        System.Numerics.Vector2 aPosition,
+        System.Numerics.Vector2 aSize,
+        System.Numerics.Vector2 bPosition,
+        System.Numerics.Vector2 bSize)
+    {
+        return aPosition.X < bPosition.X + bSize.X &&
+               aPosition.X + aSize.X > bPosition.X &&
+               aPosition.Y < bPosition.Y + bSize.Y &&
+               aPosition.Y + aSize.Y > bPosition.Y;
     }
 
     private unsafe void TryOnInspectedCharacter()
@@ -558,9 +760,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
     private void DrawInputSection()
     {
-        ImGui.TextUnformatted("① 输入");
-        ImGui.SameLine();
-        ImGui.TextDisabled("（截图后直接抓剪贴板，或填图片路径）");
+        DrawSectionTitle("截图识别", "支持剪贴板或图片文件，OCR 完全离线");
 
         // 路径输入占满整行（之前把宽度算成"剩余-200"，导致后面的按钮被窗口边缘裁掉）
         if (!this.pathInit)
@@ -625,17 +825,27 @@ public sealed class LKami9GlamourHelper : ModuleBase
         "戒指", "戒指", "面部配饰", "时尚配饰",
     ];
 
+    private int CountFilledResultSlots()
+    {
+        var ringCount = Math.Min(2, this.results.Count(r => r.Slot == "戒指"));
+        var nonRingCount = ResultSlots
+            .Distinct()
+            .Where(slot => slot != "戒指")
+            .Count(slot => this.results.Any(r => r.Slot == slot));
+        return nonRingCount + ringCount;
+    }
+
     private void DrawResultSection()
     {
         if (this.results.Count == 0)
         {
-            ImGui.TextDisabled("② 识别结果（还没有）");
+            DrawSectionTitle("识别结果", "还没有读取到装备");
             return;
         }
 
         var warn = this.WarnVec;
-        var filled = this.results.Select(r => r.Slot).Distinct().Count();
-        ImGui.TextUnformatted($"② 识别结果（{this.results.Count} 件 / 14 个部位里认到 {filled} 个）");
+        var filled = this.CountFilledResultSlots();
+        DrawSectionTitle("识别结果", $"已识别 {this.results.Count} 件，覆盖 {filled}/14 个部位");
         ImGui.SameLine();
         if (ImGui.SmallButton("复制清单"))
             CopyTextToClipboard(BuildClipboardText());
@@ -1066,7 +1276,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         if (!this.config.ShowUnknowns || this.unknowns.Count == 0) return;
 
         ImGui.Separator();
-        if (!ImGui.CollapsingHeader($"③ 未识别文本 {this.unknowns.Count} 段（可手动指派成装备）###unknowns"))
+        if (!ImGui.CollapsingHeader($"未识别文本 {this.unknowns.Count} 段（可手动指派成装备）###unknowns"))
             return;
 
         ImGui.TextDisabled("这些文字没能匹配到游戏道具，可能是 OCR 错字 —— 粘贴正确名称可把它补进结果表。");
@@ -2461,9 +2671,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         if (this.results.Count == 0) return;
 
         ImGui.Spacing();
-        ImGui.TextUnformatted("③ 写入幻化模板");
-        ImGui.SameLine();
-        ImGui.TextDisabled("（把识别到的 8 件 + 染剂写进游戏自己的幻化模板）");
+        DrawSectionTitle("写入游戏模板", "把识别到的装备与染剂写入游戏幻化模板");
 
         ImGui.SetNextItemWidth(90 * ImGuiHelpers.GlobalScale);
         if (ImGui.InputInt("目标模板###plateNo", ref this.targetPlate))
@@ -2573,9 +2781,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private void DrawTryOnSection()
     {
         ImGui.Spacing();
-        ImGui.TextUnformatted("④ 本地试穿");
-        ImGui.SameLine();
-        ImGui.TextDisabled("（不需要投影台、不需要持有装备）");
+        DrawSectionTitle("本地试穿", "不需要投影台，也不需要持有装备");
 
         var noResult = this.results.Count == 0;
         using (ImRaii.Disabled(noResult))
@@ -2593,7 +2799,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
 
         if (noResult)
-            ImGui.TextDisabled("先识别一张图（② 识别结果里有内容），「试穿这套」才会可用。");
+            ImGui.TextDisabled("先在「识别与装备」中读取一套幻化，「试穿这套」才会可用。");
 
         if (!string.IsNullOrEmpty(this.tryOnStatus))
             ImGui.TextWrapped(this.tryOnStatus);
@@ -3186,10 +3392,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private void DrawPresetSection()
     {
         ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.TextUnformatted("⑤ 幻化预设");
-        ImGui.SameLine();
-        ImGui.TextDisabled("（整合 Omni「更好的幻化管理」：保存、编辑、绑定套装、本地试穿与分享）");
+        DrawSectionTitle("幻化预设", "保存、编辑、绑定套装、本地试穿与分享");
 
         using (ImRaii.Disabled(this.results.Count == 0))
         {
