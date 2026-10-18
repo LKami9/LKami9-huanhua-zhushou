@@ -3181,11 +3181,13 @@ public sealed class LKami9GlamourHelper : ModuleBase
             return;
         }
 
-        ImGui.BeginChild(
-            "###presetManagerBody",
-            new System.Numerics.Vector2(0, 430 * ImGuiHelpers.GlobalScale),
-            false);
-        if (ImGui.BeginListBox("###presetList", new System.Numerics.Vector2(250 * ImGuiHelpers.GlobalScale, 118 * ImGuiHelpers.GlobalScale)))
+        var presetListHeight =
+            this.config.Presets.Count * ImGui.GetTextLineHeightWithSpacing() +
+            ImGui.GetStyle().FramePadding.Y * 2f +
+            ImGui.GetStyle().ItemSpacing.Y;
+        if (ImGui.BeginListBox(
+                "###presetList",
+                new System.Numerics.Vector2(250 * ImGuiHelpers.GlobalScale, presetListHeight)))
         {
             for (var i = 0; i < this.config.Presets.Count; i++)
             {
@@ -3206,7 +3208,6 @@ public sealed class LKami9GlamourHelper : ModuleBase
         if (this.selectedPresetIndex < 0 || this.selectedPresetIndex >= this.config.Presets.Count)
         {
             ImGui.EndGroup();
-            ImGui.EndChild();
             return;
         }
 
@@ -3229,7 +3230,6 @@ public sealed class LKami9GlamourHelper : ModuleBase
         this.DrawPresetItemTable(selected);
         this.DrawPresetSpecialRows(selected);
         ImGui.EndGroup();
-        ImGui.EndChild();
 
         if (!string.IsNullOrEmpty(this.presetStatus))
             ImGui.TextWrapped(this.presetStatus);
