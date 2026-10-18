@@ -31,6 +31,7 @@ using OmniToolbox.Common.Module.Abstractions;
 using OmniToolbox.Common.Module.Enums;
 using OmniToolbox.Common.Module.Models;
 using OmniToolbox.Host;
+using OmniToolbox.UI.Controls;
 using OmniToolbox.UI.Theme;
 
 namespace LKami9.GlamourHelper;
@@ -291,23 +292,93 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
     }
 
+    private static void PushOmniWindowStyle()
+    {
+        var tokens = OmniTheme.Tokens;
+        var textDisabled = tokens.Text with { W = tokens.Text.W * 0.55f };
+        var titleBackground = System.Numerics.Vector4.Lerp(tokens.Background, tokens.Primary, 0.35f);
+        var titleActive = System.Numerics.Vector4.Lerp(tokens.Background, tokens.Accent, 0.65f);
+
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, tokens.Background with { W = 1f });
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, System.Numerics.Vector4.Zero);
+        ImGui.PushStyleColor(ImGuiCol.PopupBg, tokens.Background with { W = 1f });
+        ImGui.PushStyleColor(ImGuiCol.Border, tokens.Border);
+        ImGui.PushStyleColor(ImGuiCol.Text, tokens.Text);
+        ImGui.PushStyleColor(ImGuiCol.TextDisabled, textDisabled);
+        ImGui.PushStyleColor(ImGuiCol.Button, tokens.Surface);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, OmniTheme.HoverBackground);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, OmniTheme.ActiveBackground);
+        ImGui.PushStyleColor(ImGuiCol.Header, tokens.Surface);
+        ImGui.PushStyleColor(ImGuiCol.HeaderHovered, OmniTheme.HoverBackground);
+        ImGui.PushStyleColor(ImGuiCol.HeaderActive, tokens.Accent);
+        ImGui.PushStyleColor(ImGuiCol.FrameBg, tokens.Surface);
+        ImGui.PushStyleColor(ImGuiCol.FrameBgHovered, OmniTheme.HoverBackground);
+        ImGui.PushStyleColor(ImGuiCol.FrameBgActive, OmniTheme.ActiveBackground);
+        ImGui.PushStyleColor(ImGuiCol.Tab, tokens.Surface);
+        ImGui.PushStyleColor(ImGuiCol.TabHovered, OmniTheme.HoverBackground);
+        ImGui.PushStyleColor(ImGuiCol.TabActive, tokens.Accent);
+        ImGui.PushStyleColor(ImGuiCol.TitleBg, titleBackground);
+        ImGui.PushStyleColor(ImGuiCol.TitleBgActive, titleActive);
+        ImGui.PushStyleColor(ImGuiCol.TitleBgCollapsed, titleBackground);
+        ImGui.PushStyleColor(ImGuiCol.ScrollbarBg, tokens.Background);
+        ImGui.PushStyleColor(ImGuiCol.ScrollbarGrab, tokens.Secondary);
+        ImGui.PushStyleColor(ImGuiCol.ScrollbarGrabHovered, OmniTheme.HoverBackground);
+        ImGui.PushStyleColor(ImGuiCol.ScrollbarGrabActive, tokens.Accent);
+        ImGui.PushStyleColor(ImGuiCol.CheckMark, tokens.Success);
+        ImGui.PushStyleColor(ImGuiCol.SliderGrab, tokens.Secondary);
+        ImGui.PushStyleColor(ImGuiCol.SliderGrabActive, tokens.Accent);
+        ImGui.PushStyleColor(ImGuiCol.Separator, tokens.Border);
+        ImGui.PushStyleColor(ImGuiCol.ResizeGrip, tokens.Surface);
+        ImGui.PushStyleColor(ImGuiCol.ResizeGripHovered, OmniTheme.HoverBackground);
+        ImGui.PushStyleColor(ImGuiCol.ResizeGripActive, tokens.Accent);
+
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, OmniTheme.PopupPadding());
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, OmniTheme.Scale(tokens.BorderRadius));
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, OmniTheme.BorderThickness());
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, OmniTheme.Scale(tokens.ButtonRadius));
+        ImGui.PushStyleVar(ImGuiStyleVar.PopupRounding, OmniTheme.Scale(tokens.BorderRadius));
+        ImGui.PushStyleVar(ImGuiStyleVar.ScrollbarRounding, OmniTheme.Scale(tokens.ButtonRadius));
+        ImGui.PushStyleVar(ImGuiStyleVar.GrabRounding, OmniTheme.Scale(tokens.ButtonRadius));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, OmniTheme.Scale(new System.Numerics.Vector2(6f, 4f)));
+    }
+
+    private static void PopOmniWindowStyle()
+    {
+        ImGui.PopStyleVar(8);
+        ImGui.PopStyleColor(32);
+    }
+
     private void DrawMainWindow()
     {
         var open = this.mainWindowOpen;
+        var viewport = ImGui.GetMainViewport();
+        var initialSize = OmniTheme.Scale(new System.Numerics.Vector2(1100f, 760f));
         ImGui.SetNextWindowSize(
-            new System.Numerics.Vector2(1100 * ImGuiHelpers.GlobalScale, 760 * ImGuiHelpers.GlobalScale),
+            System.Numerics.Vector2.Min(initialSize, viewport.WorkSize),
             ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSizeConstraints(
+            OmniTheme.Scale(new System.Numerics.Vector2(680f, 480f)),
+            viewport.WorkSize);
 
-        if (ImGui.Begin(
-                "LKami9 幻化助手###LKami9GlamourMainWindow",
-                ref open,
-                ImGuiWindowFlags.NoCollapse))
+        PushOmniWindowStyle();
+        try
         {
-            this.DrawAssistantContent();
-        }
+            if (ImGui.Begin(
+                    "LKami9 幻化助手###LKami9GlamourMainWindow",
+                    ref open,
+                    ImGuiWindowFlags.NoCollapse))
+            {
+                OmniControls.DrawPopupBackground();
+                this.DrawAssistantContent();
+            }
 
-        this.mainWindowOpen = open;
-        ImGui.End();
+            this.mainWindowOpen = open;
+            ImGui.End();
+        }
+        finally
+        {
+            PopOmniWindowStyle();
+        }
     }
 
     private unsafe void DrawInspectQuickActions()
@@ -326,44 +397,89 @@ public sealed class LKami9GlamourHelper : ModuleBase
         var inspectState = addon->WindowNode->GetNodeState();
         var viewport = ImGui.GetMainViewport();
         var min = viewport.WorkPos + new System.Numerics.Vector2(8f);
-        var max = viewport.WorkPos + viewport.WorkSize - new System.Numerics.Vector2(300f, 240f);
-        var target = new System.Numerics.Vector2(
-            inspectState.TopLeft.X + inspectState.Width + 6f,
-            inspectState.TopLeft.Y);
-        var position = System.Numerics.Vector2.Clamp(target, min, System.Numerics.Vector2.Max(min, max));
+        var overlaySize = OmniTheme.Scale(new System.Numerics.Vector2(310f, 220f));
+        var inspectRight = inspectState.TopLeft.X + inspectState.Width;
+        var inspectCenter = inspectState.TopLeft.X + inspectState.Width * 0.5f;
+        var betterAddon = manager->GetAddonByName("OmniBetterGlamourActions");
+        var betterVisible = betterAddon != null &&
+                            betterAddon->IsVisible &&
+                            betterAddon->WindowNode != null;
+        var preferLeft = false;
+        if (betterVisible)
+        {
+            var betterState = betterAddon->WindowNode->GetNodeState();
+            preferLeft = betterState.TopLeft.X + betterState.Width * 0.5f >= inspectCenter;
+        }
+
+        var rightX = inspectRight + 6f;
+        var leftX = inspectState.TopLeft.X - overlaySize.X - 6f;
+        var screenRight = viewport.WorkPos.X + viewport.WorkSize.X - overlaySize.X - 8f;
+        var hasRight = rightX <= screenRight;
+        var hasLeft = leftX >= min.X;
+
+        float x;
+        float y = inspectState.TopLeft.Y;
+        if (preferLeft && hasLeft)
+            x = leftX;
+        else if (!preferLeft && hasRight)
+            x = rightX;
+        else if (hasLeft)
+            x = leftX;
+        else if (hasRight)
+            x = rightX;
+        else
+        {
+            x = inspectState.TopLeft.X;
+            y = inspectState.TopLeft.Y + inspectState.Height + 6f;
+        }
+
+        var max = viewport.WorkPos + viewport.WorkSize - overlaySize;
+        var position = System.Numerics.Vector2.Clamp(
+            new System.Numerics.Vector2(x, y),
+            min,
+            System.Numerics.Vector2.Max(min, max));
 
         ImGui.SetNextWindowPos(position, ImGuiCond.Always);
         var show = this.config.ShowInspectQuickActions;
-        if (ImGui.Begin(
-                "LKami9幻化助手###LKami9GlamourInspectActions",
-                ref show,
-                ImGuiWindowFlags.AlwaysAutoResize |
-                ImGuiWindowFlags.NoResize |
-                ImGuiWindowFlags.NoCollapse |
-                ImGuiWindowFlags.NoDocking))
+        PushOmniWindowStyle();
+        try
         {
-            ImGui.TextDisabled("当前角色查看");
-            if (ImGui.Button("试穿该角色"))
-                this.TryOnInspectedCharacter();
-            ImGui.SameLine();
-            if (ImGui.Button("保存为预设"))
-                this.AddPresetFromCharacterInspect();
-            ImGui.SameLine();
-            if (ImGui.Button("复制分享文本"))
-                this.CopyInspectedPresetToClipboard();
+            if (ImGui.Begin(
+                    "LKami9幻化助手###LKami9GlamourInspectActions",
+                    ref show,
+                    ImGuiWindowFlags.AlwaysAutoResize |
+                    ImGuiWindowFlags.NoResize |
+                    ImGuiWindowFlags.NoCollapse |
+                    ImGuiWindowFlags.NoDocking))
+            {
+                OmniControls.DrawPopupBackground();
+                ImGui.TextDisabled("当前角色查看");
+                if (ImGui.Button("试穿该角色"))
+                    this.TryOnInspectedCharacter();
+                ImGui.SameLine();
+                if (ImGui.Button("保存为预设"))
+                    this.AddPresetFromCharacterInspect();
+                ImGui.SameLine();
+                if (ImGui.Button("复制分享文本"))
+                    this.CopyInspectedPresetToClipboard();
 
-            if (ImGui.Button("打开完整助手"))
-                this.mainWindowOpen = true;
-            ImGui.SameLine();
-            if (ImGui.Button("清除试穿"))
-                this.StopTryOn(clear: true);
+                if (ImGui.Button("打开完整助手"))
+                    this.mainWindowOpen = true;
+                ImGui.SameLine();
+                if (ImGui.Button("清除试穿"))
+                    this.StopTryOn(clear: true);
 
-            if (!string.IsNullOrEmpty(this.presetStatus))
-                ImGui.TextWrapped(this.presetStatus);
+                if (!string.IsNullOrEmpty(this.presetStatus))
+                    ImGui.TextWrapped(this.presetStatus);
+            }
+
+            this.config.ShowInspectQuickActions = show;
+            ImGui.End();
         }
-
-        this.config.ShowInspectQuickActions = show;
-        ImGui.End();
+        finally
+        {
+            PopOmniWindowStyle();
+        }
     }
 
     private unsafe void TryOnInspectedCharacter()
