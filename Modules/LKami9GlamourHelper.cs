@@ -21,7 +21,9 @@ using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
 
+using OmenTools;
 using OmenTools.Extensions;
+using OmenTools.OmenService;
 
 using OmniToolbox.Common.Module.Abstractions;
 using OmniToolbox.Common.Module.Enums;
@@ -3286,8 +3288,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private unsafe void TickGearsetBinding()
     {
         if (!this.config.AutoApplyBoundPreset ||
-            !DalamudServices.ClientState.IsLoggedIn ||
-            DalamudServices.ObjectTable.LocalPlayer == null)
+            !DService.Instance().ClientState.IsLoggedIn ||
+            DService.Instance().ObjectTable.LocalPlayer == null)
             return;
 
         var module = RaptureGearsetModule.Instance();
@@ -3474,12 +3476,12 @@ public sealed class LKami9GlamourHelper : ModuleBase
     {
         if (string.IsNullOrWhiteSpace(input) ||
             input.Trim() is "无" or "无染色" or "不可染色")
-            return (true, 0);
+            return (true, (byte)0);
 
         var candidates = new List<string>();
         var dye = this.ResolveDye(input, candidates);
         return dye == null || dye.Value.Id > byte.MaxValue
-            ? (false, 0)
+            ? (false, (byte)0)
             : (true, (byte)dye.Value.Id);
     }
 

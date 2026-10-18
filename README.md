@@ -2,6 +2,14 @@
 
 从「石之家」幻化截图识别装备与染剂，显示持有情况与获取方式，并可写入游戏内幻化模板。
 
+GitHub：<https://github.com/LKami9/LKami9-huanhua-zhushou>
+
+在线模块清单：
+
+```text
+https://raw.githubusercontent.com/LKami9/LKami9-huanhua-zhushou/main/TreeHouseModules.json
+```
+
 ## 功能
 
 | 功能 | 说明 |
