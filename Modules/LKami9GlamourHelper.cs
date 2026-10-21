@@ -119,6 +119,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private Dictionary<uint, string>? glassesNameById;
     private Dictionary<string, uint>? hairstyleByName;
     private Dictionary<uint, string>? hairstyleNameById;
+    private readonly Dictionary<uint, string> presetItemNameCache = [];
+    private readonly Dictionary<uint, uint> presetItemIconCache = [];
 
     // ── 文字颜色：一律跟随 Omni 主题（不再单独配置）──
     //    取 OmniTheme.Tokens，切换主题/明暗时本模块会跟着变。
@@ -318,11 +320,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
     {
         var filled = this.CountFilledResultSlots();
         var stateText = this.busy ? "识别中" : this.tryOnActive ? "本地试穿中" : "就绪";
-        var stateColor = this.busy || this.tryOnActive
-            ? OmniTheme.Tokens.Accent
-            : OmniTheme.Tokens.Success;
 
-        ImGui.TextColored(stateColor, stateText);
+        ImGui.TextColored(OmniTheme.Tokens.Text, stateText);
         ImGui.SameLine();
         ImGui.TextDisabled($"装备 {filled}/14");
         ImGui.SameLine();
@@ -361,7 +360,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
 
     private static void DrawSectionTitle(string title, string subtitle = "")
     {
-        ImGui.TextColored(OmniTheme.Tokens.Accent, title);
+        ImGui.TextColored(OmniTheme.Tokens.Text, title);
         if (string.IsNullOrEmpty(subtitle))
             return;
 
@@ -385,60 +384,93 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
     }
 
-    private static void PushOmniWindowStyle()
+    private static void PushOmniWindowStyle(OmniStyleScope style)
     {
         var tokens = OmniTheme.Tokens;
+        var panel = PanelColor(tokens);
         var textDisabled = tokens.Text with { W = tokens.Text.W * 0.55f };
         var titleBackground = System.Numerics.Vector4.Lerp(tokens.Background, tokens.Primary, 0.35f);
         var titleActive = System.Numerics.Vector4.Lerp(tokens.Background, tokens.Accent, 0.65f);
 
-        ImGui.PushStyleColor(ImGuiCol.WindowBg, tokens.Background with { W = 1f });
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, System.Numerics.Vector4.Zero);
-        ImGui.PushStyleColor(ImGuiCol.PopupBg, tokens.Background with { W = 1f });
-        ImGui.PushStyleColor(ImGuiCol.Border, tokens.Border);
-        ImGui.PushStyleColor(ImGuiCol.Text, tokens.Text);
-        ImGui.PushStyleColor(ImGuiCol.TextDisabled, textDisabled);
-        ImGui.PushStyleColor(ImGuiCol.Button, tokens.Surface);
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, OmniTheme.HoverBackground);
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, OmniTheme.ActiveBackground);
-        ImGui.PushStyleColor(ImGuiCol.Header, tokens.Surface);
-        ImGui.PushStyleColor(ImGuiCol.HeaderHovered, OmniTheme.HoverBackground);
-        ImGui.PushStyleColor(ImGuiCol.HeaderActive, tokens.Accent);
-        ImGui.PushStyleColor(ImGuiCol.FrameBg, tokens.Surface);
-        ImGui.PushStyleColor(ImGuiCol.FrameBgHovered, OmniTheme.HoverBackground);
-        ImGui.PushStyleColor(ImGuiCol.FrameBgActive, OmniTheme.ActiveBackground);
-        ImGui.PushStyleColor(ImGuiCol.Tab, tokens.Surface);
-        ImGui.PushStyleColor(ImGuiCol.TabHovered, OmniTheme.HoverBackground);
-        ImGui.PushStyleColor(ImGuiCol.TabActive, tokens.Accent);
-        ImGui.PushStyleColor(ImGuiCol.TitleBg, titleBackground);
-        ImGui.PushStyleColor(ImGuiCol.TitleBgActive, titleActive);
-        ImGui.PushStyleColor(ImGuiCol.TitleBgCollapsed, titleBackground);
-        ImGui.PushStyleColor(ImGuiCol.ScrollbarBg, tokens.Background);
-        ImGui.PushStyleColor(ImGuiCol.ScrollbarGrab, tokens.Secondary);
-        ImGui.PushStyleColor(ImGuiCol.ScrollbarGrabHovered, OmniTheme.HoverBackground);
-        ImGui.PushStyleColor(ImGuiCol.ScrollbarGrabActive, tokens.Accent);
-        ImGui.PushStyleColor(ImGuiCol.CheckMark, tokens.Success);
-        ImGui.PushStyleColor(ImGuiCol.SliderGrab, tokens.Secondary);
-        ImGui.PushStyleColor(ImGuiCol.SliderGrabActive, tokens.Accent);
-        ImGui.PushStyleColor(ImGuiCol.Separator, tokens.Border);
-        ImGui.PushStyleColor(ImGuiCol.ResizeGrip, tokens.Surface);
-        ImGui.PushStyleColor(ImGuiCol.ResizeGripHovered, OmniTheme.HoverBackground);
-        ImGui.PushStyleColor(ImGuiCol.ResizeGripActive, tokens.Accent);
+        style.Color(ImGuiCol.WindowBg, panel);
+        style.Color(ImGuiCol.ChildBg, System.Numerics.Vector4.Zero);
+        style.Color(ImGuiCol.PopupBg, panel);
+        style.Color(ImGuiCol.Border, tokens.Border);
+        style.Color(ImGuiCol.Text, tokens.Text);
+        style.Color(ImGuiCol.TextDisabled, textDisabled);
+        style.Color(ImGuiCol.Button, tokens.Surface);
+        style.Color(ImGuiCol.ButtonHovered, OmniTheme.HoverBackground);
+        style.Color(ImGuiCol.ButtonActive, OmniTheme.ActiveBackground);
+        style.Color(ImGuiCol.Header, panel);
+        style.Color(ImGuiCol.HeaderHovered, OmniTheme.HoverBackground);
+        style.Color(ImGuiCol.HeaderActive, tokens.Surface);
+        style.Color(ImGuiCol.FrameBg, tokens.Surface);
+        style.Color(ImGuiCol.FrameBgHovered, OmniTheme.HoverBackground);
+        style.Color(ImGuiCol.FrameBgActive, OmniTheme.ActiveBackground);
+        style.Color(ImGuiCol.Tab, tokens.Surface);
+        style.Color(ImGuiCol.TabHovered, OmniTheme.HoverBackground);
+        style.Color(ImGuiCol.TabActive, tokens.Accent);
+        style.Color(ImGuiCol.TitleBg, titleBackground);
+        style.Color(ImGuiCol.TitleBgActive, titleActive);
+        style.Color(ImGuiCol.TitleBgCollapsed, titleBackground);
+        style.Color(ImGuiCol.ScrollbarBg, panel);
+        style.Color(ImGuiCol.ScrollbarGrab, tokens.Secondary);
+        style.Color(ImGuiCol.ScrollbarGrabHovered, OmniTheme.HoverBackground);
+        style.Color(ImGuiCol.ScrollbarGrabActive, tokens.Accent);
+        style.Color(ImGuiCol.CheckMark, tokens.Success);
+        style.Color(ImGuiCol.SliderGrab, tokens.Secondary);
+        style.Color(ImGuiCol.SliderGrabActive, tokens.Accent);
+        style.Color(ImGuiCol.Separator, tokens.Border);
+        style.Color(ImGuiCol.ResizeGrip, tokens.Surface);
+        style.Color(ImGuiCol.ResizeGripHovered, OmniTheme.HoverBackground);
+        style.Color(ImGuiCol.ResizeGripActive, tokens.Accent);
+        style.Color(ImGuiCol.TableRowBg, panel);
+        style.Color(ImGuiCol.TableRowBgAlt, panel);
+        style.Color(ImGuiCol.TableHeaderBg, panel);
 
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, OmniTheme.PopupPadding());
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, OmniTheme.Scale(tokens.BorderRadius));
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, OmniTheme.BorderThickness());
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, OmniTheme.Scale(tokens.ButtonRadius));
-        ImGui.PushStyleVar(ImGuiStyleVar.PopupRounding, OmniTheme.Scale(tokens.BorderRadius));
-        ImGui.PushStyleVar(ImGuiStyleVar.ScrollbarRounding, OmniTheme.Scale(tokens.ButtonRadius));
-        ImGui.PushStyleVar(ImGuiStyleVar.GrabRounding, OmniTheme.Scale(tokens.ButtonRadius));
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, OmniTheme.Scale(new System.Numerics.Vector2(6f, 4f)));
+        style.Var(ImGuiStyleVar.WindowPadding, OmniTheme.PopupPadding());
+        style.Var(ImGuiStyleVar.WindowRounding, OmniTheme.Scale(tokens.BorderRadius));
+        style.Var(ImGuiStyleVar.WindowBorderSize, OmniTheme.BorderThickness());
+        style.Var(ImGuiStyleVar.FrameRounding, OmniTheme.Scale(tokens.ButtonRadius));
+        style.Var(ImGuiStyleVar.PopupRounding, OmniTheme.Scale(tokens.BorderRadius));
+        style.Var(ImGuiStyleVar.ScrollbarRounding, OmniTheme.Scale(tokens.ButtonRadius));
+        style.Var(ImGuiStyleVar.GrabRounding, OmniTheme.Scale(tokens.ButtonRadius));
+        style.Var(ImGuiStyleVar.FramePadding, OmniTheme.Scale(new System.Numerics.Vector2(6f, 4f)));
     }
 
-    private static void PopOmniWindowStyle()
+    private static System.Numerics.Vector4 PanelColor(OmniToolbox.UI.Theme.ThemeTokens tokens) =>
+        System.Numerics.Vector4.Lerp(tokens.Background with { W = 1f }, tokens.Surface with { W = 1f }, 0.5f);
+
+    private sealed class OmniStyleScope : IDisposable
     {
-        ImGui.PopStyleVar(8);
-        ImGui.PopStyleColor(32);
+        private int colors;
+        private int vars;
+
+        public void Color(ImGuiCol index, System.Numerics.Vector4 color)
+        {
+            ImGui.PushStyleColor(index, color);
+            this.colors++;
+        }
+
+        public void Var(ImGuiStyleVar index, System.Numerics.Vector2 value)
+        {
+            ImGui.PushStyleVar(index, value);
+            this.vars++;
+        }
+
+        public void Var(ImGuiStyleVar index, float value)
+        {
+            ImGui.PushStyleVar(index, value);
+            this.vars++;
+        }
+
+        public void Dispose()
+        {
+            if (this.vars > 0) ImGui.PopStyleVar(this.vars);
+            if (this.colors > 0) ImGui.PopStyleColor(this.colors);
+            this.vars = 0;
+            this.colors = 0;
+        }
     }
 
     private void DrawMainWindow()
@@ -473,8 +505,9 @@ public sealed class LKami9GlamourHelper : ModuleBase
                 ImGuiCond.FirstUseEver);
         }
 
-        PushOmniWindowStyle();
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, System.Numerics.Vector2.Zero);
+        using var style = new OmniStyleScope();
+        PushOmniWindowStyle(style);
+        style.Var(ImGuiStyleVar.WindowPadding, System.Numerics.Vector2.Zero);
         try
         {
             if (ImGui.Begin(
@@ -487,6 +520,12 @@ public sealed class LKami9GlamourHelper : ModuleBase
             {
                 var framePosition = ImGui.GetWindowPos();
                 var frameSize = ImGui.GetWindowSize();
+                var tokens = OmniTheme.Tokens;
+                ImGui.GetWindowDrawList().AddRectFilled(
+                    framePosition,
+                    framePosition + frameSize,
+                    ImGui.GetColorU32(PanelColor(tokens)),
+                    OmniTheme.Scale(tokens.BorderRadius));
                 var chrome = OmniWindowChrome.Draw(
                     framePosition,
                     frameSize,
@@ -525,25 +564,19 @@ public sealed class LKami9GlamourHelper : ModuleBase
                 {
                     var (contentPosition, contentSize) = OmniWindowChrome.GetContentBounds(framePosition, frameSize);
                     ImGui.SetCursorScreenPos(contentPosition);
-                    ImGui.PushStyleVar(
+                    using var contentStyle = new OmniStyleScope();
+                    contentStyle.Var(
                         ImGuiStyleVar.WindowPadding,
                         OmniTheme.Scale(new System.Numerics.Vector2(14f, 12f)));
-                    try
-                    {
-                        ImGui.BeginChild(
-                            "###LKami9GlamourContent",
-                            contentSize,
-                            false,
-                            ImGuiWindowFlags.NoScrollbar);
-                        ImGui.PushItemWidth(MathF.Max(1f, ImGui.GetContentRegionAvail().X));
-                        this.DrawAssistantContent();
-                        ImGui.PopItemWidth();
-                        ImGui.EndChild();
-                    }
-                    finally
-                    {
-                        ImGui.PopStyleVar();
-                    }
+                    ImGui.BeginChild(
+                        "###LKami9GlamourContent",
+                        contentSize,
+                        false,
+                        ImGuiWindowFlags.NoScrollbar);
+                    ImGui.PushItemWidth(MathF.Max(1f, ImGui.GetContentRegionAvail().X));
+                    this.DrawAssistantContent();
+                    ImGui.PopItemWidth();
+                    ImGui.EndChild();
                 }
             }
 
@@ -552,8 +585,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
         finally
         {
-            ImGui.PopStyleVar();
-            PopOmniWindowStyle();
+            // style 由 OmniStyleScope 自计数回收。
         }
     }
 
@@ -603,9 +635,21 @@ public sealed class LKami9GlamourHelper : ModuleBase
             inspectState.TopLeft.X + (inspectState.Width - overlaySize.X) * 0.5f,
             inspectState.TopLeft.Y + inspectState.Height + gap);
 
-        var candidates = preferLeft
-            ? new[] { left, below, above, right }
-            : new[] { right, below, above, left };
+        Span<System.Numerics.Vector2> candidates = stackalloc System.Numerics.Vector2[4];
+        if (preferLeft)
+        {
+            candidates[0] = left;
+            candidates[1] = below;
+            candidates[2] = above;
+            candidates[3] = right;
+        }
+        else
+        {
+            candidates[0] = right;
+            candidates[1] = below;
+            candidates[2] = above;
+            candidates[3] = left;
+        }
 
         System.Numerics.Vector2? chosen = null;
         foreach (var candidate in candidates)
@@ -641,7 +685,8 @@ public sealed class LKami9GlamourHelper : ModuleBase
         ImGui.SetNextWindowPos(position, ImGuiCond.Always);
         ImGui.SetNextWindowSize(overlaySize, ImGuiCond.Always);
         var show = this.config.ShowInspectQuickActions;
-        PushOmniWindowStyle();
+        using var style = new OmniStyleScope();
+        PushOmniWindowStyle(style);
         try
         {
             if (ImGui.Begin(
@@ -654,8 +699,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
                     ImGuiWindowFlags.NoSavedSettings |
                     ImGuiWindowFlags.NoScrollbar))
             {
-                OmniControls.DrawPopupBackground();
-                ImGui.TextColored(OmniTheme.Tokens.Accent, "角色查看");
+                ImGui.TextColored(OmniTheme.Tokens.Text, "角色查看");
                 ImGui.SameLine();
                 ImGui.SetCursorPosX(
                     ImGui.GetWindowWidth() -
@@ -699,7 +743,7 @@ public sealed class LKami9GlamourHelper : ModuleBase
         }
         finally
         {
-            PopOmniWindowStyle();
+            // style 由 OmniStyleScope 自计数回收。
         }
     }
 
@@ -3431,22 +3475,34 @@ public sealed class LKami9GlamourHelper : ModuleBase
             this.config.Presets.Count * ImGui.GetTextLineHeightWithSpacing() +
             ImGui.GetStyle().FramePadding.Y * 2f +
             ImGui.GetStyle().ItemSpacing.Y;
-        if (ImGui.BeginListBox(
-                "###presetList",
-                new System.Numerics.Vector2(250 * ImGuiHelpers.GlobalScale, presetListHeight)))
+        using (var listStyle = new OmniStyleScope())
         {
-            for (var i = 0; i < this.config.Presets.Count; i++)
+            listStyle.Color(ImGuiCol.FrameBg, PanelColor(OmniTheme.Tokens));
+            if (ImGui.BeginListBox(
+                    "###presetList",
+                    new System.Numerics.Vector2(250 * ImGuiHelpers.GlobalScale, presetListHeight)))
             {
-                var preset = this.config.Presets[i];
-                var gearset = preset.GearsetIndex >= 0 ? $" [套装 {preset.GearsetIndex + 1}]" : "";
-                var active = this.activePresetIndex == i ? " [试穿中]" : "";
-                if (!ImGui.Selectable($"{DisplayPresetName(preset)}{gearset}{active}###presetSelect{i}", i == this.selectedPresetIndex))
-                    continue;
+                var clipper = new ImGuiListClipper();
+                clipper.Begin(this.config.Presets.Count);
+                while (clipper.Step())
+                {
+                    for (var i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
+                    {
+                        ImGui.PushID(i);
+                        var picked = ImGui.Selectable(
+                            this.GetPresetListLabel(this.config.Presets[i], i),
+                            i == this.selectedPresetIndex);
+                        ImGui.PopID();
+                        if (!picked)
+                            continue;
 
-                this.SelectPreset(i);
+                        this.SelectPreset(i);
+                    }
+                }
+                clipper.End();
+
+                ImGui.EndListBox();
             }
-
-            ImGui.EndListBox();
         }
 
         ImGui.SameLine();
@@ -4153,18 +4209,44 @@ public sealed class LKami9GlamourHelper : ModuleBase
     private static string DisplayPresetName(LKami9GlamourPreset preset) =>
         string.IsNullOrWhiteSpace(preset.Name) ? "未命名预设" : preset.Name;
 
+    private string GetPresetListLabel(LKami9GlamourPreset preset, int index)
+    {
+        var active = this.activePresetIndex == index;
+        if (preset.CachedListLabel.Length == 0 ||
+            !ReferenceEquals(preset.CachedLabelName, preset.Name) ||
+            preset.CachedLabelGearset != preset.GearsetIndex ||
+            preset.CachedLabelActive != active)
+        {
+            var gearset = preset.GearsetIndex >= 0 ? $" [套装 {preset.GearsetIndex + 1}]" : "";
+            var activeText = active ? " [试穿中]" : "";
+            preset.CachedListLabel = string.Concat(DisplayPresetName(preset), gearset, activeText);
+            preset.CachedLabelName = preset.Name;
+            preset.CachedLabelGearset = preset.GearsetIndex;
+            preset.CachedLabelActive = active;
+        }
+
+        return preset.CachedListLabel;
+    }
+
     private string GetPresetItemName(uint itemId)
     {
         if (itemId == 0)
             return "无";
+        if (this.presetItemNameCache.TryGetValue(itemId, out var cached))
+            return cached;
+
         try
         {
             var name = DalamudServices.DataManager.GetExcelSheet<Item>().GetRow(itemId).Name.ToString();
-            return string.IsNullOrWhiteSpace(name) ? $"道具 #{itemId}" : name;
+            name = string.IsNullOrWhiteSpace(name) ? $"道具 #{itemId}" : name;
+            this.presetItemNameCache[itemId] = name;
+            return name;
         }
         catch
         {
-            return $"道具 #{itemId}";
+            var fallback = $"道具 #{itemId}";
+            this.presetItemNameCache[itemId] = fallback;
+            return fallback;
         }
     }
 
@@ -4172,12 +4254,18 @@ public sealed class LKami9GlamourHelper : ModuleBase
     {
         if (itemId == 0)
             return 0;
+        if (this.presetItemIconCache.TryGetValue(itemId, out var cached))
+            return cached;
+
         try
         {
-            return DalamudServices.DataManager.GetExcelSheet<Item>().GetRow(itemId).Icon;
+            var icon = DalamudServices.DataManager.GetExcelSheet<Item>().GetRow(itemId).Icon;
+            this.presetItemIconCache[itemId] = icon;
+            return icon;
         }
         catch
         {
+            this.presetItemIconCache[itemId] = 0;
             return 0;
         }
     }
@@ -4553,6 +4641,11 @@ public sealed class LKami9GlamourPreset
     public uint GlassesID { get; set; }
     public uint HairstyleID { get; set; }
     public List<LKami9GlamourPresetItem> Items { get; set; } = [];
+
+    internal string CachedListLabel = "";
+    internal string? CachedLabelName;
+    internal int CachedLabelGearset = int.MinValue;
+    internal bool CachedLabelActive;
 }
 
 [Serializable]
